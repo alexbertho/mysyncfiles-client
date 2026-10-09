@@ -1,6 +1,6 @@
 use anyhow::Result;
 use fs2::FileExt;
-use mysyncfiles::{client, tpm::Identity};
+use mysyncfiles_client::{client, tpm::Identity};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,

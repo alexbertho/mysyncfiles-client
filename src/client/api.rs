@@ -21,7 +21,7 @@ pub struct Api {
     pub(super) http: Client,
     base: String,
     signer: crate::tpm::RequestSigner,
-    session: tokio::sync::Mutex<Option<crate::auth_protocol::Session>>,
+    session: tokio::sync::Mutex<Option<SessionCredentials>>,
     origin_key: ed25519_dalek::VerifyingKey,
     web_files_enabled: bool,
     web_uploads_enabled: bool,
@@ -29,6 +29,12 @@ pub struct Api {
     web_edit_enabled: bool,
     web_run_enabled: bool,
     communication: Arc<Mutex<(crate::web_status_protocol::CommunicationState, Option<i64>)>>,
+}
+
+#[derive(Clone)]
+struct SessionCredentials {
+    session: crate::auth_protocol::Session,
+    key: ed25519_dalek::SigningKey,
 }
 
 struct AuthenticatedResponse {
@@ -141,7 +147,12 @@ impl Api {
         })
     }
 
-    async fn sign_request(&self, request: &mut reqwest::Request, token: &str) -> Result<()> {
+    async fn sign_request(
+        &self,
+        request: &mut reqwest::Request,
+        token: &str,
+        key: Option<&ed25519_dalek::SigningKey>,
+    ) -> Result<()> {
         let bytes = match request.body() {
             None => &[][..],
             Some(body) => body
@@ -155,7 +166,10 @@ impl Api {
             bytes,
             token,
         )?;
-        let proof = self.signer.proof(claims).await?;
+        let proof = match key {
+            Some(key) => crate::auth_protocol::Proof::session(claims, key)?.encode()?,
+            None => self.signer.proof(claims).await?,
+        };
         request
             .headers_mut()
             .insert(crate::auth_protocol::PROOF_HEADER, proof.parse()?);
@@ -327,51 +341,89 @@ impl Api {
     }
 
     pub async fn is_approved(&self) -> Result<bool> {
-        let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
-        self.sign_request(&mut request, "").await?;
+        Ok(self.create_session().await?.is_some())
+    }
+
+    async fn create_session(&self) -> Result<Option<SessionCredentials>> {
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        getrandom::fill(&mut *seed)
+            .map_err(|error| anyhow::anyhow!("random session key: {error}"))?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let mut request = self
+            .http
+            .post(self.url("/v1/auth/session"))
+            .json(&crate::auth_protocol::SessionRequest {
+                version: crate::auth_protocol::PROTOCOL_VERSION,
+                public_key: hex::encode(key.verifying_key().to_bytes()),
+            })
+            .build()?;
+        self.sign_request(&mut request, "", None).await?;
         let response = self.execute_signed(request).await?;
         if response.status() == StatusCode::FORBIDDEN {
-            return Ok(false);
+            return Ok(None);
         }
-        let _: crate::auth_protocol::Session =
+        let session: crate::auth_protocol::Session =
             authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-        Ok(true)
+        let now = crate::auth_protocol::now();
+        anyhow::ensure!(
+            session.expires_at > now
+                && session.expires_at <= now + crate::auth_protocol::SESSION_SECONDS + 30,
+            "invalid session expiry"
+        );
+        anyhow::ensure!(
+            crate::web_status_protocol::valid_secret(&session.token),
+            "invalid session token"
+        );
+        Ok(Some(SessionCredentials { session, key }))
+    }
+
+    async fn session_credentials(&self) -> Result<SessionCredentials> {
+        let mut saved = self.session.lock().await;
+        if let Some(current) = saved
+            .as_ref()
+            .filter(|s| s.session.expires_at > crate::auth_protocol::now() + 30)
+        {
+            return Ok(current.clone());
+        }
+        let current = self
+            .create_session()
+            .await?
+            .context("device awaits administrator approval or was revoked")?;
+        *saved = Some(current.clone());
+        Ok(current)
     }
 
     async fn session_token(&self) -> Result<String> {
-        let mut session = self.session.lock().await;
-        if let Some(current) = session
-            .as_ref()
-            .filter(|s| s.expires_at > crate::auth_protocol::now() + 30)
-        {
-            return Ok(current.token.clone());
-        }
-        let mut request = self.http.post(self.url("/v1/auth/session")).build()?;
-        self.sign_request(&mut request, "").await?;
-        let response = self.execute_signed(request).await?;
-        if response.status() == StatusCode::FORBIDDEN {
-            bail!("device awaits administrator approval or was revoked");
-        }
-        let created: crate::auth_protocol::Session =
-            authenticated_json(response, CONTROL_JSON_LIMIT).await?;
-        let token = created.token.clone();
-        *session = Some(created);
-        Ok(token)
+        Ok(self.session_credentials().await?.session.token)
     }
 
     async fn send(&self, builder: reqwest::RequestBuilder) -> Result<AuthenticatedResponse> {
         let request = builder.build()?;
         for attempt in 0..2 {
-            let token = self.session_token().await?;
+            let current = self.session_credentials().await?;
+            let token = &current.session.token;
             let mut request = request.try_clone().context("request cannot be retried")?;
-            self.sign_request(&mut request, &token).await?;
+            let key =
+                (!crate::auth_protocol::requires_tpm(request.url().path())).then_some(&current.key);
+            self.sign_request(&mut request, token, key).await?;
             let response = self.execute_signed(request).await?;
             if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(response);
             }
-            *self.session.lock().await = None;
+            let mut saved = self.session.lock().await;
+            if saved.as_ref().is_some_and(|s| s.session.token == *token) {
+                *saved = None;
+            }
         }
         unreachable!()
+    }
+
+    pub async fn server_info(&self) -> Result<crate::auth_protocol::ServerInfo> {
+        authenticated_json(
+            self.send(self.http.get(self.url("/v1/server"))).await?,
+            CONTROL_JSON_LIMIT,
+        )
+        .await
     }
 
     pub(super) fn url(&self, path: &str) -> String {

@@ -238,7 +238,7 @@ pub fn publish(
     lock.lock_exclusive()
         .context("locking release publication")?;
     let latest_path = release_dir.join("latest.json");
-    let envelope_path = release_dir.join("latest.signed.json");
+    let envelope_path = release_dir.join(format!("latest-{target}.signed.json"));
     let previous = match std::fs::read(&envelope_path) {
         Ok(bytes) => Some(verify_envelope(
             &bytes,
@@ -308,12 +308,6 @@ pub fn publish(
                 manifest: B64.encode(&manifest_bytes),
                 signature: hex::encode(signature.to_bytes()),
             })?,
-        )?;
-        // Compatibility for installed v1 clients. New clients use the atomic
-        // envelope exclusively when it is available.
-        atomic_write(
-            &release_dir.join("latest.sig"),
-            format!("{}\n", hex::encode(signature.to_bytes())).as_bytes(),
         )?;
         atomic_write(&latest_path, &manifest_bytes)?;
         Ok(manifest)

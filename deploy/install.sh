@@ -1,10 +1,11 @@
 #!/bin/sh
-# Served by MySyncFiles as /install.sh. The server fills the three placeholders
-# from its configured HTTPS origin, compiled release key and systemd unit.
+# Standalone client installer. Releases come from the client repository;
+# the synchronization server is selected independently by the user.
 set -eu
 
-SERVER_URL=@MYSYNC_SERVER_URL@
-PUBLIC_KEY_HEX=@MYSYNC_PUBLIC_KEY@
+SERVER_URL=${MYSYNC_SERVER_URL:-}
+RELEASE_BASE=https://github.com/alexbertho/mysyncfiles-client/releases/latest/download
+PUBLIC_KEY_HEX='e0f2a53834504d9a3907062f5c51963051d6cca9107d04896bd383a29476dc30'
 
 if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then
     blue=$(printf '\033[34m')
@@ -33,6 +34,11 @@ say ' /_/\_\ Client setup'
 say
 say 'The installer verifies a signed release before running it.'
 
+if [ -z "$SERVER_URL" ]; then
+    [ -t 1 ] && [ -r /dev/tty ] || die 'Set MYSYNC_SERVER_URL to the HTTPS server URL, or rerun in a terminal.'
+    printf 'Server HTTPS URL: ' >/dev/tty
+    IFS= read -r SERVER_URL </dev/tty || die 'Cannot read the server URL.'
+fi
 case "$SERVER_URL" in
     https://*) ;;
     *) die 'The server must have a configured HTTPS public URL.' ;;
@@ -126,6 +132,28 @@ for tool in python3 openssl; do
     command -v "$tool" >/dev/null 2>&1 || die "Still missing $tool after dependency setup."
 done
 
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mysync"
+profile=${MYSYNC_PROFILE:-}
+default_profile=$(python3 - "$SERVER_URL" <<'PYPROFILE'
+import re, sys, urllib.parse
+url = urllib.parse.urlsplit(sys.argv[1])
+if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ('', '/'):
+    raise SystemExit('Server URL must be an HTTPS origin without credentials or a path.')
+print(re.sub(r'[^a-zA-Z0-9_-]', '-', url.netloc)[:48])
+PYPROFILE
+) || die 'Invalid server URL.'
+profile=${profile:-$default_profile}
+case "$profile" in ''|*[!a-zA-Z0-9_-]*) die 'Invalid profile name; use letters, digits, hyphens or underscores.' ;; esac
+[ "${#profile}" -le 48 ] || die 'Profile name is too long.'
+# The legacy single-profile location remains readable by daemon --all. Explicit
+# default keeps its migration path; new connections use independent files.
+if [ "$profile" = default ]; then
+    config_file="$config_dir/config.json"
+else
+    config_dir="$config_dir/profiles"
+    config_file="$config_dir/$profile.json"
+fi
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/mysync-install.XXXXXXXX") || die 'Cannot create a private temporary directory.'
 staged=
 cleanup() {
@@ -137,27 +165,15 @@ chmod 700 "$tmp"
 
 fetch() {
     address=$1 destination=$2 limit=$3 timeout=$4
-    status=$(curl --fail --silent --show-error --proto '=https' --max-redirs 0 \
+    status=$(curl --fail --silent --show-error --proto '=https' --proto-redir '=https' --location --max-redirs 5 \
         --connect-timeout 10 --max-time "$timeout" --max-filesize "$limit" \
         --output "$destination" --write-out '%{http_code}' "$address") || die "Download failed: $address"
-    [ "$status" = 200 ] || die "Server returned HTTP $status for $address (redirects are not allowed)."
-}
-
-fetch_optional() {
-    address=$1 destination=$2 limit=$3 timeout=$4
-    status=$(curl --silent --show-error --proto '=https' --max-redirs 0 \
-        --connect-timeout 10 --max-time "$timeout" --max-filesize "$limit" \
-        --output "$destination" --write-out '%{http_code}' "$address") || die "Download failed: $address"
-    case "$status" in
-        200) return 0 ;;
-        404) rm -f -- "$destination"; return 1 ;;
-        *) die "Server returned HTTP $status for $address (redirects are not allowed)." ;;
-    esac
+    [ "$status" = 200 ] || die "Server returned HTTP $status for $address (HTTPS redirects are limited to five)."
 }
 
 step 2 'Downloading signed release metadata'
-base="$SERVER_URL/v1/updates/$target"
-if fetch_optional "$base/latest.signed.json" "$tmp/latest.signed.json" 32768 30; then
+base="$RELEASE_BASE"
+fetch "$base/latest-$target.signed.json" "$tmp/latest.signed.json" 32768 30
     if ! python3 - "$tmp" "$PUBLIC_KEY_HEX" <<'PY'
 import base64, binascii, json, pathlib, re, sys
 
@@ -180,10 +196,6 @@ PY
     then
         die 'Cannot prepare release signature verification.'
     fi
-else
-    fetch "$base/latest.json" "$tmp/latest.json" 16384 30
-    fetch "$base/latest.sig" "$tmp/latest.sig" 256 30
-fi
 
 if ! python3 - "$tmp" "$PUBLIC_KEY_HEX" "$target" <<'PY'
 import json, pathlib, re, sys
@@ -365,7 +377,20 @@ else
 fi
 
 cat > "$tmp/mysync.service" <<'MYSYNC_UNIT'
-@MYSYNC_UNIT@
+[Unit]
+Description=MySyncFiles client
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mysync daemon --all
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
 MYSYNC_UNIT
 unit="$unit_dir/mysync.service"
 service_ready=1
@@ -383,8 +408,6 @@ else
 fi
 say
 
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mysync"
-config_file="$config_dir/config.json"
 legacy_profile=0
 if [ -e "$config_file" ] || [ -L "$config_file" ]; then
     legacy_profile=$(python3 - "$config_file" <<'PY'
@@ -406,12 +429,12 @@ PY
 fi
 if [ "$legacy_profile" = 1 ]; then
     [ ! -L "$config_dir" ] || die "Refusing symbolic-link client config directory: $config_dir"
-    for file in "$config_file" "$config_dir/config.state.json" "$config_dir/config.state.journal"; do
+    for file in "$config_file" "${config_file%.json}.state.json" "${config_file%.json}.state.journal"; do
         if [ -e "$file" ] || [ -L "$file" ]; then
             [ ! -L "$file" ] && [ -f "$file" ] || die "Refusing non-regular legacy client file: $file"
         fi
     done
-    for file in "$config_dir/config.pairing.json" "$config_dir/config.enrollment.json"; do
+    for file in "${config_file%.json}.pairing.json" "${config_file%.json}.enrollment.json"; do
         [ ! -e "$file" ] && [ ! -L "$file" ] || die "A TPM pairing is already pending; review $file before replacing the legacy profile."
     done
     if systemctl --user is-active --quiet mysync.service; then
@@ -429,7 +452,7 @@ if [ "$legacy_profile" = 1 ]; then
         *) die 'The legacy profile and local revision state were left untouched.' ;;
     esac
     profile_backup=$(mktemp -d "$config_dir/legacy-profile.XXXXXXXX") || die 'Cannot create a private legacy profile backup.'
-    for file in "$config_dir/config.state.json" "$config_dir/config.state.journal" "$config_file"; do
+    for file in "${config_file%.json}.state.json" "${config_file%.json}.state.journal" "$config_file"; do
         if [ -e "$file" ]; then
             mv -T -- "$file" "$profile_backup/${file##*/}" || die "Could not archive $file; inspect $profile_backup before retrying."
         fi
@@ -440,15 +463,15 @@ fi
 
 if [ -t 1 ] && [ -r /dev/tty ]; then
     step 6 'Pairing this client with the server'
-    printf 'Folder to synchronize [%s/Sync]: ' "$HOME" >/dev/tty
+    printf 'Folder to synchronize [%s/Sync/%s]: ' "$HOME" "$profile" >/dev/tty
     mirror_dir=
     IFS= read -r mirror_dir </dev/tty || die 'Cannot read the folder from the terminal.'
-    [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync"
-    set -- setup --server "$SERVER_URL" --dir "$mirror_dir"
+    [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync/$profile"
+    set -- setup --server "$SERVER_URL" --dir "$mirror_dir" --config "$config_file"
     if [ "$supports_web_status" = 1 ]; then
         if [ -z "$web_status" ]; then
             # Preserve a saved choice, including a setup interrupted before approval.
-            web_status=$(python3 - "$config_file" "$config_dir/config.pairing.json" <<'PY'
+            web_status=$(python3 - "$config_file" "${config_file%.json}.pairing.json" <<'PY'
 import json, pathlib, sys
 
 enabled = True
@@ -497,6 +520,6 @@ PY
 else
     setup_option=
     [ -z "$web_status" ] || setup_option=" --web-status $web_status"
-    say "Next: run $destination setup --server $SERVER_URL --dir \"\$HOME/Sync\"$setup_option in a terminal."
+    say "Next: run $destination setup --config \"$config_file\" --server $SERVER_URL --dir \"\$HOME/Sync\"$setup_option in a terminal."
     say 'The user service remains stopped until setup succeeds.'
 fi

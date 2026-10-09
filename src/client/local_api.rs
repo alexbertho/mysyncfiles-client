@@ -80,13 +80,44 @@ fn optional_ipv6(result: std::io::Result<TcpListener>) -> std::io::Result<Option
     }
 }
 
+type BridgeProfile = (Arc<Api>, Arc<Mutex<DaemonState>>);
+
 impl LocalBridge {
     pub fn start(api: Arc<Api>, activity: Arc<Mutex<DaemonState>>) -> Result<Self> {
         Self::start_on_port(api, activity, PORT)
     }
 
     fn start_on_port(api: Arc<Api>, activity: Arc<Mutex<DaemonState>>, port: u16) -> Result<Self> {
-        let origin = api.web_origin()?;
+        Self::start_profiles_on_port(vec![(api, activity)], port)
+    }
+
+    pub fn start_many(profiles: Vec<BridgeProfile>) -> Result<Self> {
+        Self::start_profiles_on_port(profiles, PORT)
+    }
+
+    fn start_profiles_on_port(profiles: Vec<BridgeProfile>, port: u16) -> Result<Self> {
+        let mut states = HashMap::new();
+        for (api, activity) in profiles {
+            let origin = api.web_origin()?;
+            anyhow::ensure!(
+                !states.contains_key(&origin),
+                "multiple web profiles have the same origin"
+            );
+            states.insert(
+                origin.clone(),
+                Arc::new(BridgeState {
+                    api,
+                    origin,
+                    instance_id: random_secret()?,
+                    activity,
+                    attempts: Mutex::new(VecDeque::new()),
+                    used: Mutex::new(HashMap::new()),
+                    proof_limit: Semaphore::new(1),
+                    runner: super::runner::Runner::default(),
+                    runner_limit: Semaphore::new(2),
+                }),
+            );
+        }
         // Bind both before spawning anything: a collision disables the entire
         // bridge. Never fall back to an arbitrary port or a non-loopback address.
         let ipv4_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -96,24 +127,17 @@ impl LocalBridge {
         let ipv6_address = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port);
         let v6 = optional_ipv6(bind(ipv6_address))
             .with_context(|| format!("cannot bind IPv6 loopback {ipv6_address}"))?;
-        let state = Arc::new(BridgeState {
-            api,
-            origin,
-            instance_id: random_secret()?,
-            activity,
-            attempts: Mutex::new(VecDeque::new()),
-            used: Mutex::new(HashMap::new()),
-            proof_limit: Semaphore::new(1),
-            runner: super::runner::Runner::default(),
-            runner_limit: Semaphore::new(2),
-        });
         Ok(Self {
-            task: tokio::spawn(serve(v4, v6, state)),
+            task: tokio::spawn(serve(v4, v6, Arc::new(states))),
         })
     }
 }
 
-async fn serve(v4: TcpListener, v6: Option<TcpListener>, state: Arc<BridgeState>) {
+async fn serve(
+    v4: TcpListener,
+    v6: Option<TcpListener>,
+    states: Arc<HashMap<String, Arc<BridgeState>>>,
+) {
     let mut connections = JoinSet::new();
     let limit = Arc::new(Semaphore::new(8));
     loop {
@@ -136,18 +160,18 @@ async fn serve(v4: TcpListener, v6: Option<TcpListener>, state: Arc<BridgeState>
             continue;
         };
         let host = address.to_string();
-        let state = state.clone();
+        let states = states.clone();
         let _ = socket.set_nodelay(true);
         connections.spawn(async move {
             let _permit = permit;
             let service =
                 service_fn(move |request: Request<hyper::body::Incoming>| {
-                    let state = state.clone();
+                    let states = states.clone();
                     let host = host.clone();
                     async move {
                         let result = tokio::time::timeout(
                             Duration::from_secs(10),
-                            handle(state, &host, request.map(Body::new)),
+                            dispatch(&states, &host, request.map(Body::new)),
                         )
                         .await;
                         Ok::<_, Infallible>(result.unwrap_or_else(|_| {
@@ -196,6 +220,18 @@ fn cors(mut response: Response, origin: &str) -> Response {
     headers.insert("cache-control", "no-store".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     response
+}
+
+async fn dispatch(
+    states: &HashMap<String, Arc<BridgeState>>,
+    host: &str,
+    request: Request<Body>,
+) -> Response {
+    let Some(state) = header(request.headers(), "origin").and_then(|origin| states.get(origin))
+    else {
+        return failure(StatusCode::FORBIDDEN, "origin_refused");
+    };
+    handle(state.clone(), host, request).await
 }
 
 async fn handle(state: Arc<BridgeState>, host: &str, request: Request<Body>) -> Response {
@@ -487,6 +523,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_server_bridge_dispatches_only_the_exact_origin() -> Result<()> {
+        let first = state()?;
+        let mut second = state()?;
+        Arc::get_mut(&mut second).unwrap().origin = "https://other.example.com".into();
+        let states = HashMap::from([
+            (first.origin.clone(), first),
+            (second.origin.clone(), second),
+        ]);
+        for origin in ["https://sync.example.com", "https://other.example.com"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri("/v1/status")
+                .header("host", "127.0.0.1:47831")
+                .header("origin", origin)
+                .header(BRIDGE_HEADER, "1")
+                .body(Body::empty())?;
+            let response = dispatch(&states, "127.0.0.1:47831", request).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()["access-control-allow-origin"], origin);
+        }
+        let request = Request::builder()
+            .uri("/v1/status")
+            .header("host", "127.0.0.1:47831")
+            .header("origin", "https://unknown.example.com")
+            .body(Body::empty())?;
+        let response = dispatch(&states, "127.0.0.1:47831", request).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+        let first = state()?;
+        assert!(
+            LocalBridge::start_profiles_on_port(
+                vec![
+                    (first.api.clone(), first.activity.clone()),
+                    (first.api.clone(), first.activity.clone())
+                ],
+                0
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn probes_are_constant_and_http_policy_precedes_tpm() -> Result<()> {
         let state = state()?;
         let response = handle(
@@ -673,7 +756,11 @@ mod tests {
             std::io::ErrorKind::AddrInUse
         );
         let bridge = LocalBridge {
-            task: tokio::spawn(serve(v4, v6, state.clone())),
+            task: tokio::spawn(serve(
+                v4,
+                v6,
+                Arc::new(HashMap::from([(state.origin.clone(), state.clone())])),
+            )),
         };
         let http = reqwest::Client::builder().no_proxy().build()?;
         let response = http

@@ -4,7 +4,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/mysync daemon
+ExecStart=%h/.local/bin/mysync daemon --all
 Restart=always
 RestartSec=5
 UMask=0077

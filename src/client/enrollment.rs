@@ -311,6 +311,7 @@ pub async fn setup_with_options(
     if parent.canonicalize()?.starts_with(&root) {
         bail!("config must be outside the synchronized folder");
     }
+    let registration = super::profiles::registration_lock(config_path, &root)?;
     let pair_path = config_path.with_extension("pairing.json");
     if config_path.exists() {
         let config = load_config(config_path)?;
@@ -368,6 +369,7 @@ pub async fn setup_with_options(
     }
     drop(pair_lock);
     println!("Pairing code: {}", request.code);
+    drop(registration);
     println!("Ask the administrator to run `make pair` on the server. Waiting...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let pending_path = config_path.with_extension("enrollment.json");
@@ -494,6 +496,7 @@ pub async fn enroll_with_tcti(
     if parent.canonicalize()?.starts_with(&root) {
         bail!("config must be outside the synchronized folder");
     }
+    let registration = super::profiles::registration_lock(config_path, &root)?;
     let _lock = acquire_lock(config_path).await?;
     if config_path.exists() {
         bail!("config already exists; enrollment requires a fresh client profile");
@@ -557,6 +560,7 @@ pub async fn enroll_with_tcti(
         pending.config.web_status_enabled = enabled;
         private_write_json(&pending_path, &pending)?;
     }
+    drop(registration);
     let api = Api::new(&pending.config)?;
     if pending.challenge.is_none() {
         let identity = pending

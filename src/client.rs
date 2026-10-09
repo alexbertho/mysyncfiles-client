@@ -19,6 +19,7 @@ mod api;
 mod enrollment;
 pub mod local_api;
 mod metrics;
+pub mod profiles;
 mod runner;
 pub use api::Api;
 pub use enrollment::{
@@ -98,6 +99,7 @@ pub struct SyncReport {
 }
 
 pub struct Status {
+    pub server_name: String,
     pub issues: Vec<ScanIssue>,
     pub local_files: usize,
     pub remote_files: usize,
@@ -788,12 +790,13 @@ pub async fn status(config_path: &Path) -> Result<Status> {
     let config = load_config(config_path)?;
     let api = Api::new(&config)?;
     let mirror = Mirror::open(&config.root)?;
-    let (manifest, scanned) = tokio::try_join!(
+    let (manifest, scanned, info) = tokio::try_join!(
         async {
             let _timing = metrics::Phase::start("manifest");
             api.manifest_summary().await
         },
-        scan(&mirror)
+        scan(&mirror),
+        api.server_info()
     )?;
     let local = scanned.files;
     let mut issues = scanned.issues;
@@ -826,6 +829,7 @@ pub async fn status(config_path: &Path) -> Result<Status> {
         Ok(())
     })?);
     Ok(Status {
+        server_name: info.name,
         issues,
         local_files: local.len(),
         remote_files: manifest.files,
@@ -854,6 +858,15 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
     } else {
         None
     };
+    daemon_with_runtime(config_path, config, api, activity).await
+}
+
+async fn daemon_with_runtime(
+    config_path: &Path,
+    config: ClientConfig,
+    api: std::sync::Arc<Api>,
+    activity: std::sync::Arc<std::sync::Mutex<crate::web_status_protocol::DaemonState>>,
+) -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let watch_root = config.root.clone();
@@ -910,7 +923,7 @@ pub async fn daemon(config_path: &Path) -> Result<()> {
                 while rx.try_recv().is_ok() {}
             },
             _ = update_interval.tick(), if config.auto_update => {
-                let update = crate::update::check_and_install(&config.server, &config.update_public_key);
+                let update = crate::update::check_and_install(&config.update_public_key);
                 tokio::pin!(update);
                 tokio::select! {
                     result = &mut update => match result {

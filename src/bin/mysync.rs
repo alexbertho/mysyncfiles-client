@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use mysyncfiles::client::{self, Api, SyncReport};
+use mysyncfiles_client::client::{self, Api, SyncReport};
 
 #[derive(Parser)]
 #[command(
@@ -17,6 +17,9 @@ struct Cli {
     /// Configuration file (default: XDG_CONFIG_HOME/mysync/config.json)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Named server connection, independent of all other profiles
+    #[arg(long, global = true, conflicts_with = "config")]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -84,7 +87,13 @@ enum Command {
     /// Run one synchronization pass
     Sync,
     /// Watch local changes and poll the server continuously
-    Daemon,
+    Daemon {
+        /// Synchronize every registered server concurrently through one browser bridge
+        #[arg(long)]
+        all: bool,
+    },
+    /// List local server profiles without connecting
+    Profiles,
     /// Show local and server file counts
     Status,
     /// List recoverable server-side deletions
@@ -171,7 +180,57 @@ fn server_key(config: &Path, supplied: Option<String>) -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.unwrap_or(client::default_config_path()?);
+    if matches!(cli.command, Command::Profiles) {
+        for (name, path) in client::profiles::list()? {
+            let config = client::load_config(&path)?;
+            println!("{name}\t{}\t{}", config.server, config.root.display());
+        }
+        return Ok(());
+    }
+    if matches!(cli.command, Command::Daemon { all: true }) {
+        if cli.profile.is_some() || cli.config.is_some() {
+            bail!("--all cannot be combined with --profile or --config");
+        }
+        return client::profiles::daemon_all().await;
+    }
+    if let Command::Doctor { ek_cert } = &cli.command {
+        let certificate = ek_cert
+            .as_deref()
+            .map(mysyncfiles_client::tpm::read_ek_certificate)
+            .transpose()?;
+        let kind = mysyncfiles_client::tpm::doctor_with_certificate(
+            &mysyncfiles_client::tpm::default_tcti(),
+            certificate.as_deref(),
+        )?;
+        println!("TPM 2.0 is reachable and the {kind} EK matches its certificate.");
+        println!("Manufacturer trust is checked during enrollment.");
+        return Ok(());
+    }
+    if matches!(cli.command, Command::Update) {
+        let key = if cli.profile.is_some() || cli.config.is_some() {
+            let path = client::profiles::selected(cli.profile.as_deref(), cli.config)?;
+            client::load_config(&path)?.update_public_key
+        } else {
+            mysyncfiles_client::release::PUBLIC_KEY_HEX
+                .trim()
+                .to_owned()
+        };
+        match mysyncfiles_client::update::check_and_install(&key).await? {
+            mysyncfiles_client::update::UpdateOutcome::Current {
+                installed_version,
+                published_version,
+            } => println!(
+                "installed client: {installed_version}; latest signed release: {published_version}; no update installed"
+            ),
+            mysyncfiles_client::update::UpdateOutcome::Installed(version) => {
+                println!(
+                    "installed {version}; restart the running daemon or mysync.service to use this version"
+                )
+            }
+        }
+        return Ok(());
+    }
+    let config_path = client::profiles::selected(cli.profile.as_deref(), cli.config)?;
     match cli.command {
         Command::Setup {
             server,
@@ -204,18 +263,7 @@ async fn main() -> Result<()> {
             }
             println!("Initial synchronization verified; the service can now be started.");
         }
-        Command::Doctor { ek_cert } => {
-            let certificate = ek_cert
-                .as_deref()
-                .map(mysyncfiles::tpm::read_ek_certificate)
-                .transpose()?;
-            let kind = mysyncfiles::tpm::doctor_with_certificate(
-                &mysyncfiles::tpm::default_tcti(),
-                certificate.as_deref(),
-            )?;
-            println!("TPM 2.0 is reachable and the {kind} EK matches its certificate.");
-            println!("Manufacturer trust is checked during enrollment.");
-        }
+        Command::Doctor { .. } => unreachable!(),
         Command::Enroll {
             server,
             server_public_key,
@@ -321,9 +369,11 @@ async fn main() -> Result<()> {
             }
         },
         Command::Sync => print_report(client::sync(&config_path).await?),
-        Command::Daemon => client::daemon(&config_path).await?,
+        Command::Daemon { .. } => client::daemon(&config_path).await?,
+        Command::Profiles => unreachable!(),
         Command::Status => {
             let status = client::status(&config_path).await?;
+            println!("server_name={}", status.server_name);
             println!(
                 "local_files={} remote_files={} pending_local={} conflicts={} server_generation={}",
                 status.local_files,
@@ -342,24 +392,7 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Update => {
-            let config = client::load_config(&config_path)?;
-            match mysyncfiles::update::check_and_install(&config.server, &config.update_public_key)
-                .await?
-            {
-                mysyncfiles::update::UpdateOutcome::Current {
-                    installed_version,
-                    published_version,
-                } => println!(
-                    "installed client: {installed_version}; latest signed release: {published_version}; no update installed"
-                ),
-                mysyncfiles::update::UpdateOutcome::Installed(version) => {
-                    println!(
-                        "installed {version}; restart the running daemon or mysync.service to use this version"
-                    )
-                }
-            }
-        }
+        Command::Update => unreachable!(),
         Command::Restore { id } => {
             let api = Api::new(&client::load_config(&config_path)?)?;
             let entry = api.restore(id).await?;

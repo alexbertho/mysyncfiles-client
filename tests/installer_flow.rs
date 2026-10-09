@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mysyncfiles::release;
+use mysyncfiles_client::release;
 use std::{
     fs,
     io::Write,
@@ -21,6 +21,12 @@ struct InstallerFixture {
     home: PathBuf,
     script: PathBuf,
     mocks: PathBuf,
+}
+
+fn safe_directory(path: impl AsRef<Path>) -> Result<()> {
+    fs::create_dir_all(&path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(())
 }
 
 fn executable(path: &Path, bytes: &str) -> Result<()> {
@@ -99,14 +105,18 @@ destination= url=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --output) destination=$2; shift 2 ;;
-        --write-out|--proto|--max-redirs|--connect-timeout|--max-time|--max-filesize) shift 2 ;;
-        --fail|--silent|--show-error) shift ;;
+        --write-out|--proto|--proto-redir|--max-redirs|--connect-timeout|--max-time|--max-filesize) shift 2 ;;
+        --fail|--silent|--show-error|--location) shift ;;
         *) url=$1; shift ;;
     esac
 done
+case "$url" in
+    https://github.com/alexbertho/mysyncfiles-client/releases/latest/download/*) ;;
+    *) echo 'Client releases must come from the client repository' >&2; exit 1 ;;
+esac
 file=${url##*/}
 if [ "${MYSYNC_TEST_HTTP_STATUS:-200}" != 200 ] && {
-    [ "$file" = latest.signed.json ] || [ "$file" = latest.json ] || [ "$file" = latest.sig ];
+    [ "$file" = latest-linux-x86_64.signed.json ] || [ "$file" = latest-linux-aarch64.signed.json ] || [ "$file" = latest.json ] || [ "$file" = latest.sig ];
 }; then
     printf '%s' "$MYSYNC_TEST_HTTP_STATUS"
     exit 0
@@ -129,8 +139,11 @@ printf 200
         fs::write(
             &script,
             template
-                .replace("@MYSYNC_SERVER_URL@", "'https://sync.example.test'")
-                .replace("@MYSYNC_PUBLIC_KEY@", &format!("'{public}'"))
+                .replace(
+                    "SERVER_URL=${MYSYNC_SERVER_URL:-}",
+                    "SERVER_URL=https://sync.example.test\nMYSYNC_PROFILE=default",
+                )
+                .replace(release::PUBLIC_KEY_HEX.trim(), &public)
                 .replace(
                     "@MYSYNC_UNIT@",
                     include_str!("../deploy/mysync.service").trim_end_matches('\n'),
@@ -247,7 +260,7 @@ fn mock_inaccessible_tss_device(fixture: &InstallerFixture) -> Result<()> {
     )?;
     executable(
         &fixture.mocks.join("id"),
-        "#!/bin/sh\ncase \"$1\" in\n  -un) echo alex;;\n  -nG) if [ \"$#\" -eq 1 ]; then echo 'alex users'; elif [ \"${MYSYNC_TEST_TSS_ASSIGNED:-}\" = 1 ]; then echo 'alex users tss'; else echo 'alex users'; fi;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n  -un) echo test-user;;\n  -nG) if [ \"$#\" -eq 1 ]; then echo 'test-user users'; elif [ \"${MYSYNC_TEST_TSS_ASSIGNED:-}\" = 1 ]; then echo 'test-user users tss'; else echo 'test-user users'; fi;;\nesac\n",
     )?;
     executable(
         &fixture.mocks.join("sudo"),
@@ -263,7 +276,10 @@ fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<(
     let output = fixture.run("200")?;
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("sudo usermod -aG tss alex"), "{stderr}");
+    assert!(
+        stderr.contains("sudo usermod -aG tss test-user"),
+        "{stderr}"
+    );
     assert!(!fixture.root.join("sudo-called").exists());
     fixture.assert_not_installed();
 
@@ -299,13 +315,13 @@ fn installer_offers_tss_group_update_in_a_terminal() -> Result<()> {
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Add alex to the tss group with sudo?"),
+        stdout.contains("Add test-user to the tss group with sudo?"),
         "{stdout}"
     );
     assert!(stdout.contains("Sign out and back in"), "{stdout}");
     assert_eq!(
         fs::read_to_string(fixture.root.join("sudo-called"))?,
-        "usermod -aG tss alex\n"
+        "usermod -aG tss test-user\n"
     );
     fixture.assert_not_installed();
     Ok(())
@@ -341,7 +357,7 @@ fn installer_backs_up_an_older_or_different_same_version_client() -> Result<()> 
     for previous_version in ["0.2.9", "0.3.0"] {
         let fixture = InstallerFixture::new(true)?;
         let bin_dir = fixture.home.join(".local/bin");
-        fs::create_dir_all(&bin_dir)?;
+        safe_directory(&bin_dir)?;
         let old_binary = format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'mysync {previous_version}'; else exit 2; fi\n"
         );
@@ -349,7 +365,11 @@ fn installer_backs_up_an_older_or_different_same_version_client() -> Result<()> 
 
         let output = fixture.run("200")?;
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Back up"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Back up"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(fs::read_to_string(bin_dir.join("mysync"))?, old_binary);
 
         let output = fixture.run_interactive_with_input("0", false, b"y\n\n\n")?;
@@ -384,8 +404,8 @@ fn installer_archives_a_legacy_token_profile_before_pairing() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     let config_dir = fixture.home.join(".config/mysync");
     let mirror = fixture.home.join("Sync");
-    fs::create_dir_all(&config_dir)?;
-    fs::create_dir_all(&mirror)?;
+    safe_directory(&config_dir)?;
+    safe_directory(&mirror)?;
     fs::write(mirror.join("local.txt"), "local content")?;
     let profile = serde_json::to_vec(&serde_json::json!({
         "server": "https://sync.example.test",
@@ -438,7 +458,7 @@ fn installer_archives_a_legacy_token_profile_before_pairing() -> Result<()> {
 fn installer_leaves_legacy_profile_untouched_without_consent() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     let config_dir = fixture.home.join(".config/mysync");
-    fs::create_dir_all(&config_dir)?;
+    safe_directory(&config_dir)?;
     fs::write(config_dir.join("config.json"), b"{\"token\":\"old\"}")?;
     fs::write(config_dir.join("config.state.json"), b"old state")?;
 
@@ -511,13 +531,17 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
 
     let custom_unit = InstallerFixture::new(true)?;
     let unit_dir = custom_unit.home.join(".config/systemd/user");
-    fs::create_dir_all(&unit_dir)?;
+    safe_directory(&unit_dir)?;
     fs::write(
         unit_dir.join("mysync.service"),
         "[Service]\nExecStart=/custom/client\n",
     )?;
     let output = custom_unit.run_interactive("0", false)?;
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     assert!(custom_unit.root.join("setup-called").exists());
     assert!(!custom_unit.root.join("systemctl-called").exists());
     Ok(())
@@ -545,7 +569,7 @@ fn installer_offers_web_status_and_preserves_saved_opt_out() -> Result<()> {
     for filename in ["config.json", "config.pairing.json"] {
         let fixture = InstallerFixture::new(true)?;
         let config_dir = fixture.home.join(".config/mysync");
-        fs::create_dir_all(&config_dir)?;
+        safe_directory(&config_dir)?;
         fs::write(config_dir.join(filename), b"{\"web_status_enabled\":false}")?;
         let output = fixture.run_interactive("0", false)?;
         assert!(
@@ -615,7 +639,7 @@ fn source_installer_applies_web_status_before_starting_service() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
     executable(&fixture.mocks.join("id"), "#!/bin/sh\necho test-user\n")?;
     let config = fixture.home.join(".config/mysync/config.json");
-    fs::create_dir_all(config.parent().unwrap())?;
+    safe_directory(config.parent().unwrap())?;
     fs::write(
         &config,
         serde_json::to_vec(&serde_json::json!({
@@ -671,11 +695,13 @@ fn piped_installer_still_pairs_in_an_interactive_terminal() -> Result<()> {
 #[test]
 fn signed_installer_rejects_bad_signature_binary_and_tpm() -> Result<()> {
     let invalid_signature = InstallerFixture::new(true)?;
-    fs::remove_file(invalid_signature.releases.join("latest.signed.json"))?;
-    fs::write(
-        invalid_signature.releases.join("latest.sig"),
-        "00".repeat(64),
-    )?;
+    let path = invalid_signature.releases.join(format!(
+        "latest-{}.signed.json",
+        release::current_target().unwrap()
+    ));
+    let mut envelope: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    envelope["signature"] = serde_json::Value::String("00".repeat(64));
+    fs::write(path, serde_json::to_vec(&envelope)?)?;
     let output = invalid_signature.run("200")?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("signature is invalid"));
@@ -683,7 +709,10 @@ fn signed_installer_rejects_bad_signature_binary_and_tpm() -> Result<()> {
 
     let invalid_envelope = InstallerFixture::new(true)?;
     fs::write(
-        invalid_envelope.releases.join("latest.signed.json"),
+        invalid_envelope.releases.join(format!(
+            "latest-{}.signed.json",
+            release::current_target().unwrap()
+        )),
         serde_json::json!({"manifest": "", "signature": "00".repeat(64)}).to_string(),
     )?;
     let output = invalid_envelope.run("200")?;
@@ -720,12 +749,16 @@ fn signed_installer_rejects_redirects_and_missing_releases() -> Result<()> {
 #[test]
 fn signed_installer_does_not_replace_existing_client_or_follow_bin_symlink() -> Result<()> {
     let existing = InstallerFixture::new(true)?;
-    fs::create_dir_all(existing.home.join(".local/bin"))?;
+    safe_directory(existing.home.join(".local/bin"))?;
     let destination = existing.home.join(".local/bin/mysync");
     executable(&destination, "#!/bin/sh\necho 'mysync 9.0.0'\n")?;
     let output = existing.run("200")?;
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("refusing to downgrade"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing to downgrade"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         fs::read_to_string(destination)?,
         "#!/bin/sh\necho 'mysync 9.0.0'\n"
@@ -753,5 +786,52 @@ fn signed_installer_rejects_unsupported_architecture() -> Result<()> {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported CPU architecture"));
     fixture.assert_not_installed();
+    Ok(())
+}
+
+#[test]
+fn installer_selects_an_independent_profile_from_the_server_origin() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    let script = fs::read_to_string(&fixture.script)?;
+    fs::write(
+        &fixture.script,
+        script.replace("\nMYSYNC_PROFILE=default", ""),
+    )?;
+    let output = fixture.run_interactive("0", false)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let setup = fs::read_to_string(fixture.root.join("setup-called"))?;
+    assert!(setup.contains("profiles/sync-example-test.json"), "{setup}");
+    assert!(setup.contains("--server https://sync.example.test"));
+    assert!(
+        fs::read_to_string(fixture.home.join(".config/systemd/user/mysync.service"))?
+            .contains("daemon --all")
+    );
+    Ok(())
+}
+
+#[test]
+fn installer_rejects_invalid_origins_even_with_an_explicit_profile() -> Result<()> {
+    for url in [
+        "https://sync.example.test/path",
+        "https://user:password@sync.example.test",
+        "https://sync.example.test?query=1",
+        "https://",
+    ] {
+        let fixture = InstallerFixture::new(true)?;
+        let script = fs::read_to_string(&fixture.script)?;
+        fs::write(
+            &fixture.script,
+            script.replace(
+                "SERVER_URL=https://sync.example.test",
+                &format!("SERVER_URL='{url}'"),
+            ),
+        )?;
+        assert!(!fixture.run("200")?.status.success());
+        fixture.assert_not_installed();
+    }
     Ok(())
 }

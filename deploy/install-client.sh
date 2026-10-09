@@ -15,7 +15,13 @@ if [[ -z ${HOME:-} ]]; then
 fi
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}"
-config_path="$config_dir/mysync/config.json"
+profile=${MYSYNC_PROFILE:-default}
+case "$profile" in ''|*[!a-zA-Z0-9_-]*) printf 'Invalid MYSYNC_PROFILE.\n' >&2; exit 1 ;; esac
+if [[ "$profile" == default ]]; then
+    config_path="$config_dir/mysync/config.json"
+else
+    config_path="$config_dir/mysync/profiles/$profile.json"
+fi
 destination_dir="$HOME/.local/bin"
 unit_dir="$config_dir/systemd/user"
 account=$(id -un)

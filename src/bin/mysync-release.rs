@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use mysyncfiles::release;
+use mysyncfiles_client::release;
 
 #[derive(Parser)]
 #[command(

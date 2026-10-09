@@ -106,9 +106,18 @@ async fn fetch_small(http: &Client, url: &str, limit: usize) -> Result<Option<Ve
     Ok(Some(bytes))
 }
 
-pub async fn check_and_install(server: &str, public_key: &str) -> Result<UpdateOutcome> {
+pub const RELEASE_BASE: &str =
+    "https://github.com/alexbertho/mysyncfiles-client/releases/latest/download";
+
+pub async fn check_and_install(public_key: &str) -> Result<UpdateOutcome> {
     let executable = installed_executable()?;
-    check_and_install_at(server, public_key, &executable, env!("CARGO_PKG_VERSION")).await
+    check_and_install_at(
+        RELEASE_BASE,
+        public_key,
+        &executable,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
 }
 
 pub async fn check_and_install_at(
@@ -117,31 +126,39 @@ pub async fn check_and_install_at(
     executable: &Path,
     current_version: &str,
 ) -> Result<UpdateOutcome> {
-    crate::auth_protocol::validate_server_url(server)?;
+    let source = reqwest::Url::parse(server)?;
+    anyhow::ensure!(
+        source.username().is_empty()
+            && source.password().is_none()
+            && source.query().is_none()
+            && source.fragment().is_none(),
+        "invalid release URL"
+    );
+    let loopback = matches!(source.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    anyhow::ensure!(
+        source.scheme() == "https" || (source.scheme() == "http" && loopback),
+        "release URL must use HTTPS"
+    );
     let target = release::current_target().ok_or_else(|| anyhow!("unsupported client platform"))?;
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || attempt.url().scheme() != "https" {
+                attempt.error("release redirects must remain HTTPS and bounded")
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()?;
-    let base = format!("{}/v1/updates/{target}", server.trim_end_matches('/'));
-    let manifest = if let Some(bytes) = fetch_small(
+    let base = server.trim_end_matches('/');
+    let bytes = fetch_small(
         &http,
-        &format!("{base}/latest.signed.json"),
+        &format!("{base}/latest-{target}.signed.json"),
         release::MAX_ENVELOPE_BYTES,
     )
     .await?
-    {
-        release::verify_envelope(&bytes, public_key)?
-    } else {
-        // Only absence permits v1 fallback; invalid signatures never do.
-        let bytes = fetch_small(&http, &format!("{base}/latest.json"), 16 * 1024)
-            .await?
-            .context("release manifest missing")?;
-        let signature = fetch_small(&http, &format!("{base}/latest.sig"), 256)
-            .await?
-            .context("release signature missing")?;
-        release::verify_manifest(&bytes, std::str::from_utf8(&signature)?, public_key)?
-    };
+    .context("signed client release missing from the client repository")?;
+    let manifest = release::verify_envelope(&bytes, public_key)?;
     if manifest.target != target {
         bail!("release target does not match this client");
     }
