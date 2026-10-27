@@ -23,3 +23,19 @@ MYSYNC_EK_CERT="$HOME/.config/mysync/ek.der" sh install.sh
 ```
 
 Pour les autres fabricants, le script indique comment identifier le TPM et fournir ce certificat. Si AMD ou Intel ne renvoie aucun certificat correspondant, vérifier la connectivité vers le service indiqué et les informations de prise en charge du firmware auprès du constructeur du PC. Ne pas publier le certificat ou l’identifiant EK dans un ticket public.
+
+## Refus HTTP 401 pendant l’appairage
+
+Le nom demandé par `make pair` est un libellé choisi par l’administrateur pour reconnaître le PC, par exemple `pc-bureau`. Conserver le même nom et le même code pour reprendre une demande encore valide ; après expiration, relancer l’installateur et utiliser le code qu’il affiche.
+
+Si `/v1/enroll/start` renvoie HTTP 401, consulter `make logs` côté serveur. Le contrôle `doctor` vérifie que le certificat correspond au TPM ; la chaîne constructeur n’est vérifiée par le serveur que pendant l’appairage. Un message serveur « untrusted or expired EK certificate » peut donc provenir d’un intermédiaire manquant même si le certificat est encore valide.
+
+Le client 0.4.1 complète automatiquement les intermédiaires AMD, notamment ceux de familles telles que `PRG-RPL`. Il lit l’adresse CA Issuers du certificat, accepte seulement le dépôt AMD attendu, utilise HTTPS, limite la taille et le nombre de certificats et vérifie la signature de chaque lien. Il présente la chaîne au serveur sans modifier ses autorités de confiance. L’absence d’index NV contenant la chaîne n’empêche plus cette découverte.
+
+Avec un ancien client ou une chaîne constructeur obtenue séparément, fournir ses intermédiaires au format PEM :
+
+```sh
+MYSYNC_EK_CHAIN=/chemin/intermediaires.pem sh install.sh
+```
+
+Après réception de la preuve TPM, comparer l’empreinte complète affichée sur le PC et le serveur avant de confirmer l’approbation dans `make pair`.

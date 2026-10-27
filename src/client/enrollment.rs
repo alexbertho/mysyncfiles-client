@@ -16,23 +16,37 @@ use std::{
 
 const EK_ISSUER_LIMIT: usize = 16 * 1024;
 
-fn allowed_intel_ca_issuer_url(uri: &str) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(uri)?;
+fn allowed_ek_ca_issuer_url(uri: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(uri)?;
+    let amd = url.host_str() == Some("ftpm.amd.com");
+    // AMD's certificates advertise HTTP AIA URLs; fetch the same public issuer
+    // from AMD's HTTPS endpoint, without following an HTTP redirect.
+    if amd && url.scheme() == "http" && url.port_or_known_default() == Some(80) {
+        url.set_scheme("https")
+            .map_err(|_| anyhow!("cannot upgrade AMD issuer URL to HTTPS"))?;
+    }
+    let repository = if amd {
+        url.path()
+            .strip_prefix("/pki/aia/")
+            .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    } else {
+        url.host_str() == Some("tsci.intel.com")
+            && url.path().starts_with("/content/OnDieCA/certs/")
+    };
     ensure!(
         url.scheme() == "https"
-            && url.host_str() == Some("tsci.intel.com")
             && url.port_or_known_default() == Some(443)
             && url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && url.path().starts_with("/content/OnDieCA/certs/"),
-        "TPM EK issuer URL is outside Intel's HTTPS certificate repository"
+            && repository,
+        "TPM EK issuer URL is outside the supported manufacturer HTTPS repositories"
     );
     Ok(url)
 }
 
-fn intel_ca_issuer_url(der: &[u8]) -> Result<Option<reqwest::Url>> {
+fn ca_issuer_uri(der: &[u8]) -> Result<Option<String>> {
     use x509_parser::extensions::{GeneralName, ParsedExtension};
 
     let (_, certificate) = x509_parser::parse_x509_certificate(der)
@@ -43,7 +57,7 @@ fn intel_ca_issuer_url(der: &[u8]) -> Result<Option<reqwest::Url>> {
                 if description.access_method.to_id_string() == "1.3.6.1.5.5.7.48.2"
                     && let GeneralName::URI(uri) = &description.access_location
                 {
-                    return Ok(Some(allowed_intel_ca_issuer_url(uri)?));
+                    return Ok(Some((*uri).to_owned()));
                 }
             }
         }
@@ -51,13 +65,13 @@ fn intel_ca_issuer_url(der: &[u8]) -> Result<Option<reqwest::Url>> {
     Ok(None)
 }
 
-async fn fetch_intel_issuer(http: &Client, url: reqwest::Url) -> Result<Vec<u8>> {
+async fn fetch_ek_issuer(http: &Client, url: reqwest::Url) -> Result<Vec<u8>> {
     let response = http.get(url).send().await?.error_for_status()?;
     ensure!(
         response
             .content_length()
             .is_none_or(|n| n <= EK_ISSUER_LIMIT as u64),
-        "Intel EK issuer certificate is too large"
+        "Manufacturer EK issuer certificate is too large"
     );
     tokio::time::timeout(JSON_TIMEOUT, async {
         let mut stream = response.bytes_stream();
@@ -66,30 +80,45 @@ async fn fetch_intel_issuer(http: &Client, url: reqwest::Url) -> Result<Vec<u8>>
             let chunk = chunk?;
             ensure!(
                 chunk.len() <= EK_ISSUER_LIMIT - bytes.len(),
-                "Intel EK issuer certificate is too large"
+                "Manufacturer EK issuer certificate is too large"
             );
             bytes.extend_from_slice(&chunk);
         }
         let certificate = openssl::x509::X509::from_der(&bytes)
-            .context("Intel EK issuer certificate must be DER")?;
+            .context("Manufacturer EK issuer certificate must be DER")?;
         ensure!(
             certificate.to_der()? == bytes,
-            "Intel EK issuer response contains trailing data"
+            "Manufacturer EK issuer response contains trailing data"
         );
         Ok(bytes)
     })
     .await?
 }
 
-async fn complete_intel_ek_chain(leaf: &[u8], embedded: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
-    if embedded.is_empty() {
-        return Ok(Vec::new());
-    }
+async fn complete_ek_chain(leaf: &[u8], embedded: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
     let http = Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(JSON_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    complete_ek_chain_with_fetch(leaf, embedded, |url| fetch_ek_issuer(&http, url)).await
+}
+
+async fn complete_ek_chain_with_fetch<F, Fut>(
+    leaf: &[u8],
+    embedded: Vec<Vec<u8>>,
+    mut fetch: F,
+) -> Result<Vec<Vec<u8>>>
+where
+    F: FnMut(reqwest::Url) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    let amd = ca_issuer_uri(leaf)?
+        .and_then(|uri| reqwest::Url::parse(&uri).ok())
+        .is_some_and(|url| url.host_str() == Some("ftpm.amd.com"));
+    if embedded.is_empty() && !amd {
+        return Ok(Vec::new());
+    }
     let mut remaining = embedded;
     let mut chain = Vec::new();
     let mut current = openssl::x509::X509::from_der(leaf)?;
@@ -113,10 +142,10 @@ async fn complete_intel_ek_chain(leaf: &[u8], embedded: Vec<Vec<u8>>) -> Result<
         let der = if let Some(position) = position {
             remaining.remove(position)
         } else {
-            let url = intel_ca_issuer_url(&current.to_der()?)?.context(
-                "TPM EK issuer is absent from the embedded chain and has no Intel CA Issuers URL",
+            let uri = ca_issuer_uri(&current.to_der()?)?.context(
+                "TPM EK issuer is absent from the embedded chain and has no CA Issuers URL; supply --ek-chain with the manufacturer intermediates",
             )?;
-            fetch_intel_issuer(&http, url).await?
+            fetch(allowed_ek_ca_issuer_url(&uri)?).await?
         };
         let issuer = openssl::x509::X509::from_der(&der)?;
         let issuer_key = issuer.public_key()?;
@@ -587,7 +616,7 @@ pub async fn enroll_with_tcti(
             let cert_identity = identity.clone();
             let embedded =
                 tokio::task::spawn_blocking(move || cert_identity.ek_intermediates()).await??;
-            complete_intel_ek_chain(&leaf, embedded).await?
+            complete_ek_chain(&leaf, embedded).await?
         };
         for cert in intermediates {
             chain.push(hex::encode(cert));
@@ -651,7 +680,7 @@ mod tests {
         // Public CA certificate from Intel's OnDieCA certificate repository.
         let certificate = include_bytes!("../../tests/fixtures/intel-odca-ca2.der");
         assert_eq!(
-            intel_ca_issuer_url(certificate)?.unwrap().as_str(),
+            allowed_ek_ca_issuer_url(&ca_issuer_uri(certificate)?.unwrap())?.as_str(),
             "https://tsci.intel.com/content/OnDieCA/certs/OnDie_CA_RootCA_Certificate.cer"
         );
         for url in [
@@ -661,8 +690,70 @@ mod tests {
             "https://tsci.intel.com:8443/content/OnDieCA/certs/issuer.cer",
             "https://tsci.intel.com/private/issuer.cer",
         ] {
-            assert!(allowed_intel_ca_issuer_url(url).is_err(), "{url}");
+            assert!(allowed_ek_ca_issuer_url(url).is_err(), "{url}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn amd_issuer_aia_upgrades_only_the_exact_manufacturer_repository() -> Result<()> {
+        let certificate = include_bytes!("../../tests/fixtures/amd-prg-rpl.der");
+        assert_eq!(
+            allowed_ek_ca_issuer_url(&ca_issuer_uri(certificate)?.unwrap())?.as_str(),
+            "https://ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121"
+        );
+        for url in [
+            "http://ftpm.amd.com.evil.example/pki/aia/264D39A23CEB5D5B49D610044EEBD121",
+            "https://127.0.0.1/pki/aia/264D39A23CEB5D5B49D610044EEBD121",
+            "https://ftpm.amd.com:8443/pki/aia/264D39A23CEB5D5B49D610044EEBD121",
+            "http://ftpm.amd.com:8080/pki/aia/264D39A23CEB5D5B49D610044EEBD121",
+            "https://user@ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121",
+            "https://ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121?extra=1",
+            "https://ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121#extra",
+            "https://ftpm.amd.com/private/264D39A23CEB5D5B49D610044EEBD121",
+            "https://ftpm.amd.com/pki/aia/not-a-certificate",
+            "https://ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121/extra",
+        ] {
+            assert!(allowed_ek_ca_issuer_url(url).is_err(), "{url}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn amd_chain_is_completed_without_embedded_nv_certificates() -> Result<()> {
+        // Public AMD CA certificates, used only as test inputs. They are never
+        // added to a production trust store by the client.
+        let certificate = include_bytes!("../../tests/fixtures/amd-prg-rpl.der");
+        let root = include_bytes!("../../tests/fixtures/amd-tpm-rsa-root.der");
+        let mut requests = Vec::new();
+        let chain = complete_ek_chain_with_fetch(certificate, Vec::new(), |url| {
+            requests.push(url.to_string());
+            async { Ok(root.to_vec()) }
+        })
+        .await?;
+        assert_eq!(chain, vec![root.to_vec()]);
+        assert_eq!(
+            requests,
+            vec!["https://ftpm.amd.com/pki/aia/264D39A23CEB5D5B49D610044EEBD121"]
+        );
+
+        let error = complete_ek_chain_with_fetch(certificate, Vec::new(), |_| async {
+            Ok(include_bytes!("../../tests/fixtures/intel-odca-ca2.der").to_vec())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("does not sign its child"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn intel_without_an_embedded_chain_does_not_start_aia_discovery() -> Result<()> {
+        let certificate = include_bytes!("../../tests/fixtures/intel-odca-ca2.der");
+        let chain = complete_ek_chain_with_fetch(certificate, Vec::new(), |_| async {
+            panic!("unexpected certificate request")
+        })
+        .await?;
+        assert!(chain.is_empty());
         Ok(())
     }
 }
