@@ -50,7 +50,6 @@ case "$(uname -m)" in
     *) die 'Unsupported CPU architecture; use Linux x86-64 or AArch64.' ;;
 esac
 [ -n "${HOME:-}" ] || die 'HOME is not set.'
-command -v curl >/dev/null 2>&1 || die 'curl is required to download the client.'
 
 distribution=other
 if [ -r /etc/os-release ]; then
@@ -67,7 +66,12 @@ say 'The client will probe the TPM before installation.'
 
 offer_packages() {
     packages=$1
-    [ -r /dev/tty ] || die "Install $packages with your package manager, then retry in a terminal."
+    case "$distribution" in
+        debian) package_command="sudo apt-get install --no-install-recommends $packages" ;;
+        arch) package_command="sudo pacman -S --needed $packages" ;;
+        *) die "Install $packages with your package manager, then retry." ;;
+    esac
+    [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die "Missing system packages. Run: $package_command; then rerun this installer."
     command -v sudo >/dev/null 2>&1 || die "sudo is unavailable; install $packages manually."
     printf 'Install system packages with sudo (%s)? [y/N] ' "$packages" >/dev/tty
     answer=
@@ -78,12 +82,38 @@ offer_packages() {
     esac
     case "$distribution" in
         debian)
-            sudo apt-get update
+            sudo apt-get update || die 'Package index update failed; resolve the package manager error above, then rerun this installer.'
             # The package list is fixed by this script, never obtained from a download.
-            sudo apt-get install -y --no-install-recommends $packages
+            sudo apt-get install -y --no-install-recommends $packages || die 'Package installation failed; resolve the error above, then rerun this installer.'
             ;;
-        arch) sudo pacman -S --needed $packages ;;
+        arch) sudo pacman -S --needed $packages || die 'Package installation failed; resolve the error above, then rerun this installer.' ;;
     esac
+}
+
+require_tools() {
+    missing_tools= packages=
+    for required_tool do
+        if ! command -v "$required_tool" >/dev/null 2>&1; then
+            missing_tools="$missing_tools $required_tool"
+            case "$required_tool" in
+                python3)
+                    if [ "$distribution" = arch ]; then package=python; else package=python3; fi
+                    ;;
+                flock) package=util-linux ;;
+                systemctl) package=systemd ;;
+                tpm2_*) package=tpm2-tools ;;
+                *) package=$required_tool ;;
+            esac
+            case " $packages " in *" $package "*) ;; *) packages="${packages:+$packages }$package" ;; esac
+        fi
+    done
+    if [ -n "$missing_tools" ]; then
+        warn "Missing tools:$missing_tools"
+        offer_packages "$packages"
+    fi
+    for required_tool do
+        command -v "$required_tool" >/dev/null 2>&1 || die "Still missing $required_tool after dependency setup; check your package manager output."
+    done
 }
 
 if [ -e /dev/tpmrm0 ] && { [ ! -r /dev/tpmrm0 ] || [ ! -w /dev/tpmrm0 ]; }; then
@@ -115,22 +145,7 @@ if [ -e /dev/tpmrm0 ] && { [ ! -r /dev/tpmrm0 ] || [ ! -w /dev/tpmrm0 ]; }; then
     esac
 fi
 
-missing=
-for tool in python3 openssl; do
-    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
-done
-if [ -n "$missing" ]; then
-    warn "Missing tools:$missing"
-    case "$distribution" in
-        debian) packages='python3 openssl' ;;
-        arch) packages='python openssl' ;;
-        *) die 'Install Python 3 and OpenSSL 3 using your distribution package manager, then retry.' ;;
-    esac
-    offer_packages "$packages"
-fi
-for tool in python3 openssl; do
-    command -v "$tool" >/dev/null 2>&1 || die "Still missing $tool after dependency setup."
-done
+require_tools curl python3 openssl flock systemctl
 
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mysync"
 profile=${MYSYNC_PROFILE:-}
@@ -165,15 +180,22 @@ chmod 700 "$tmp"
 
 fetch() {
     address=$1 destination=$2 limit=$3 timeout=$4
+    missing_message=${5:-}
+    download_failed=0
     status=$(curl --fail --silent --show-error --proto '=https' --proto-redir '=https' --location --max-redirs 5 \
         --connect-timeout 10 --max-time "$timeout" --max-filesize "$limit" \
-        --output "$destination" --write-out '%{http_code}' "$address") || die "Download failed: $address"
+        --output "$destination" --write-out '%{http_code}' "$address") || download_failed=1
+    if [ "$status" = 404 ] && [ -n "$missing_message" ]; then
+        die "$missing_message"
+    fi
+    [ "$download_failed" = 0 ] || die "Download failed: $address"
     [ "$status" = 200 ] || die "Server returned HTTP $status for $address (HTTPS redirects are limited to five)."
 }
 
 step 2 'Downloading signed release metadata'
 base="$RELEASE_BASE"
-fetch "$base/latest-$target.signed.json" "$tmp/latest.signed.json" 32768 30
+fetch "$base/latest-$target.signed.json" "$tmp/latest.signed.json" 32768 30 \
+    "Signed release metadata is unavailable for $target (HTTP 404). The repository maintainer must publish a signed client release with latest-$target.signed.json and its matching binary, marked as latest. See https://github.com/alexbertho/mysyncfiles-client/blob/main/docs/releases.md"
     if ! python3 - "$tmp" "$PUBLIC_KEY_HEX" <<'PY'
 import base64, binascii, json, pathlib, re, sys
 
@@ -289,12 +311,122 @@ if [ "$supports_web_status" = 0 ]; then
 fi
 ok 'Binary integrity and compatibility verified.'
 
+recover_ek_certificate() {
+    warn 'The TPM is reachable, but its manufacturer certificate is missing or unreadable.'
+    say 'The installer can check the TPM manufacturer and help retrieve its certificate.'
+    require_tools tpm2_getcap tpm2_createek tpm2_getekcertificate
+    tpm2_getcap -T device:/dev/tpmrm0 properties-fixed >"$tmp/tpm-properties" 2>"$tmp/tpm-tools-error" \
+        || die 'Cannot read TPM properties. Check access with: tpm2_getcap -T device:/dev/tpmrm0 properties-fixed'
+    manufacturer=$(python3 - "$tmp/tpm-properties" <<'PY'
+import pathlib, re, sys
+properties = pathlib.Path(sys.argv[1]).read_text()
+match = re.search(r'(?m)^TPM2_PT_MANUFACTURER:[ \t]*\n[ \t]+raw:[ \t]*(0x[0-9a-fA-F]+)[ \t]*$', properties)
+vendor = int(match[1], 16) if match else None
+print({0x414d4400: 'AMD', 0x494e5443: 'Intel'}.get(vendor, 'other'))
+PY
+) || die 'Cannot identify the TPM manufacturer.'
+    case "$manufacturer" in
+        AMD) certificate_host=ftpm.amd.com ;;
+        Intel) certificate_host=ekop.intel.com ;;
+        *) die 'Automatic certificate retrieval is supported for AMD and Intel TPMs. Obtain a manufacturer DER EK certificate and rerun with MYSYNC_EK_CERT=/path/to/ek.der. Identify this TPM with: tpm2_getcap -T device:/dev/tpmrm0 properties-fixed' ;;
+    esac
+    say "TPM manufacturer: $manufacturer"
+    say "The certificate can be requested from $certificate_host over verified HTTPS."
+    say "This sends an identifier derived from this TPM's public key to $manufacturer."
+    [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] \
+        || die 'Rerun this installer in a terminal to retrieve the certificate, or supply MYSYNC_EK_CERT=/path/to/manufacturer-ek.der.'
+    printf 'Download and save this PC\047s TPM certificate from %s? [y/N] ' "$manufacturer" >/dev/tty
+    answer=
+    IFS= read -r answer </dev/tty || true
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) die 'Certificate download declined. Supply MYSYNC_EK_CERT=/path/to/manufacturer-ek.der to continue.' ;;
+    esac
+    say "Retrieving the $manufacturer TPM certificate (trying RSA-2048, then P-256 if needed)..."
+    # tpm2-tools selects the manufacturer's HTTPS service. TLS verification stays
+    # enabled; the signed client independently checks the certificate and TPM key.
+    if ! python3 - "$tmp" <<'PY'
+import pathlib, resource, shutil, subprocess, sys
+
+directory = pathlib.Path(sys.argv[1])
+tcti = ['-T', 'device:/dev/tpmrm0']
+def limit_download():
+    resource.setrlimit(resource.RLIMIT_FSIZE, (16384, 16384))
+    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+
+with (directory / 'ek-recovery.log').open('wb') as log:
+    for algorithm in ('rsa', 'ecc'):
+        public = directory / f'ek-{algorithm}.pub'
+        certificate = directory / f'ek-{algorithm}.der'
+        try:
+            subprocess.run(['tpm2_createek', *tcti, '-G', algorithm, '-u', str(public), '-c', str(directory / f'ek-{algorithm}.ctx')], check=True, timeout=30, stdout=log, stderr=log)
+            subprocess.run(['tpm2_getekcertificate', *tcti, '-u', str(public), '-o', str(certificate)], check=True, timeout=60, preexec_fn=limit_download, stdout=log, stderr=log)
+            if not certificate.is_file() or not 0 < certificate.stat().st_size <= 16384:
+                continue
+            subprocess.run([str(directory / 'mysync'), 'doctor', '--ek-cert', str(certificate)], check=True, timeout=30, stdout=log, stderr=log)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        shutil.copyfile(certificate, directory / 'recovered-ek.der')
+        sys.exit(0)
+sys.exit(1)
+PY
+    then
+        die "Could not retrieve a certificate matching this TPM. Check network access to $certificate_host and your TPM firmware, or supply a manufacturer DER certificate with MYSYNC_EK_CERT=/path/to/ek.der. The client was not installed."
+    fi
+    if ! python3 - "$tmp/recovered-ek.der" "$ek_cache" <<'PY'
+import os, pathlib, stat, sys, tempfile
+
+source, destination = map(pathlib.Path, sys.argv[1:])
+parent = destination.parent
+if parent.is_symlink():
+    raise SystemExit(f'Refusing symbolic-link certificate directory: {parent}')
+parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+info = parent.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+    raise SystemExit(f'Unsafe certificate directory: {parent}')
+if destination.exists() or destination.is_symlink():
+    info = destination.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise SystemExit(f'Refusing unsafe certificate file: {destination}')
+descriptor, staged = tempfile.mkstemp(prefix='.ek-', dir=parent)
+try:
+    with os.fdopen(descriptor, 'wb') as output:
+        output.write(source.read_bytes())
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(staged, destination)
+finally:
+    if os.path.exists(staged):
+        os.unlink(staged)
+PY
+    then
+        die 'Cannot safely save the verified TPM certificate.'
+    fi
+    MYSYNC_EK_CERT=$ek_cache
+    ok "TPM certificate matches this PC and was saved at $MYSYNC_EK_CERT"
+}
+
 step 4 'Checking TPM 2.0 and EK certificate'
+ek_cache="${XDG_CONFIG_HOME:-$HOME/.config}/mysync/ek.der"
 if [ -n "${MYSYNC_EK_CERT:-}" ]; then
     [ -r "$MYSYNC_EK_CERT" ] || die 'MYSYNC_EK_CERT is not readable by this user.'
     "$tmp/mysync" doctor --ek-cert "$MYSYNC_EK_CERT" || die 'TPM preflight failed; check the diagnostic above for TPM access or an EK certificate mismatch.'
+elif [ -e "$ek_cache" ] || [ -L "$ek_cache" ]; then
+    [ ! -L "$ek_cache" ] && [ -f "$ek_cache" ] || die "Refusing unsafe saved TPM certificate: $ek_cache"
+    if "$tmp/mysync" doctor --ek-cert "$ek_cache" >"$tmp/tpm-check" 2>&1; then
+        MYSYNC_EK_CERT=$ek_cache
+        ok 'Saved TPM certificate verified.'
+    else
+        warn 'The saved TPM certificate could not be verified; it will only be replaced after a successful retrieval.'
+        recover_ek_certificate
+    fi
+elif "$tmp/mysync" doctor >"$tmp/tpm-check" 2>&1; then
+    cat "$tmp/tpm-check"
+elif grep -Fq 'no readable RSA-2048 or P-256 EK certificate was found' "$tmp/tpm-check"; then
+    recover_ek_certificate
 else
-    "$tmp/mysync" doctor || die 'TPM preflight failed; check the diagnostic above. If the EK certificate is absent from TPM NV, supply its manufacturer DER certificate with MYSYNC_EK_CERT=/actual/path/ek.der.'
+    cat "$tmp/tpm-check" >&2
+    die 'TPM preflight failed. Check TPM access and firmware settings using the diagnostic above, then rerun this installer.'
 fi
 
 step 5 'Installing client and background service'
@@ -518,8 +650,16 @@ PY
     fi
     say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
 else
-    setup_option=
-    [ -z "$web_status" ] || setup_option=" --web-status $web_status"
-    say "Next: run $destination setup --config \"$config_file\" --server $SERVER_URL --dir \"\$HOME/Sync\"$setup_option in a terminal."
+    set -- "$destination" setup --config "$config_file" --server "$SERVER_URL" --dir "$HOME/Sync"
+    [ -z "$web_status" ] || set -- "$@" --web-status "$web_status"
+    [ -z "${MYSYNC_EK_CERT:-}" ] || set -- "$@" --ek-cert "$MYSYNC_EK_CERT"
+    [ -z "${MYSYNC_EK_CHAIN:-}" ] || set -- "$@" --ek-chain "$MYSYNC_EK_CHAIN"
+    [ -z "${MYSYNC_SERVER_PUBLIC_KEY:-}" ] || set -- "$@" --server-public-key "$MYSYNC_SERVER_PUBLIC_KEY"
+    next_command=$(python3 - "$@" <<'PY'
+import shlex, sys
+print(shlex.join(sys.argv[1:]))
+PY
+) || die 'Cannot prepare the setup command.'
+    say "Next: run $next_command in a terminal."
     say 'The user service remains stopped until setup succeeds.'
 fi

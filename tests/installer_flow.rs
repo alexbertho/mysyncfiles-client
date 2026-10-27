@@ -75,7 +75,14 @@ impl InstallerFixture {
             &format!(
                 "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'mysync 0.3.0';;\n  doctor) if [ \"${{MYSYNC_TEST_REQUIRE_EK_CERT:-}}\" = 1 ] && [ \"$2\" != --ek-cert ]; then echo 'EK cert missing' >&2; exit 1; fi; {};;\n  setup) if [ \"$2\" = --help ]; then {}; fi; test -t 0 || exit 23; printf '%s\\n' \"$*\" > \"$MYSYNC_TEST_SETUP_CALLED\"; exit \"${{MYSYNC_TEST_SETUP_EXIT:-0}}\";;\n  *) exit 1;;\nesac\n",
                 if doctor_ok {
-                    "echo 'TPM 2.0 is ready.'"
+                    r#"if [ -e "$MYSYNC_TEST_ROOT/needs-ek" ]; then
+    if [ "${2:-}" != --ek-cert ]; then
+        echo 'TPM 2.0 is reachable, but no readable RSA-2048 or P-256 EK certificate was found' >&2
+        exit 1
+    fi
+    [ "$(cat "$3")" = valid-test-certificate ] || { echo 'EK certificate public key does not match this TPM' >&2; exit 1; }
+fi
+echo 'TPM 2.0 is ready.'"#
                 } else {
                     "echo 'TPM unavailable' >&2; exit 1"
                 },
@@ -119,7 +126,7 @@ if [ "${MYSYNC_TEST_HTTP_STATUS:-200}" != 200 ] && {
     [ "$file" = latest-linux-x86_64.signed.json ] || [ "$file" = latest-linux-aarch64.signed.json ] || [ "$file" = latest.json ] || [ "$file" = latest.sig ];
 }; then
     printf '%s' "$MYSYNC_TEST_HTTP_STATUS"
-    exit 0
+    exit "${MYSYNC_TEST_CURL_EXIT:-0}"
 fi
 if [ ! -e "$MYSYNC_TEST_RELEASES/$file" ]; then
     printf 404
@@ -164,6 +171,12 @@ printf 200
     }
 
     fn command(&self, program: &str) -> Result<Command> {
+        let limited_path = self.root.join("limited-path");
+        let path = if limited_path.is_dir() {
+            limited_path.display().to_string()
+        } else {
+            format!("{}:{}", self.mocks.display(), std::env::var("PATH")?)
+        };
         let mut command = Command::new(program);
         command
             .env("HOME", &self.home)
@@ -173,18 +186,86 @@ printf 200
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
             .env_remove("MYSYNC_WEB_STATUS")
+            .env_remove("MYSYNC_EK_CERT")
+            .env("MYSYNC_TEST_ROOT", &self.root)
+            .env(
+                "MYSYNC_TEST_INSTALL_BIN",
+                if limited_path.is_dir() {
+                    &limited_path
+                } else {
+                    &self.mocks
+                },
+            )
             .env("MYSYNC_TEST_RELEASES", &self.releases)
             .env("MYSYNC_TEST_HTTP_STATUS", "200")
+            .env("MYSYNC_TEST_CURL_EXIT", "0")
             .env("MYSYNC_TEST_SETUP_CALLED", self.root.join("setup-called"))
             .env(
                 "MYSYNC_TEST_SYSTEMCTL_CALLED",
                 self.root.join("systemctl-called"),
             )
-            .env(
-                "PATH",
-                format!("{}:{}", self.mocks.display(), std::env::var("PATH")?),
-            );
+            .env("PATH", path);
         Ok(command)
+    }
+
+    fn without_tools(&self, missing: &[&str]) -> Result<()> {
+        let destination = self.root.join("limited-path");
+        let mut commands = Vec::new();
+        for tool in [
+            "cat",
+            "chmod",
+            "cmp",
+            "cp",
+            "curl",
+            "flock",
+            "grep",
+            "id",
+            "install",
+            "ln",
+            "mkdir",
+            "mktemp",
+            "mv",
+            "openssl",
+            "python3",
+            "rm",
+            "script",
+            "sed",
+            "sh",
+            "stat",
+            "sudo",
+            "systemctl",
+            "tpm2_createek",
+            "tpm2_getcap",
+            "tpm2_getekcertificate",
+            "uname",
+        ] {
+            if missing.contains(&tool) {
+                continue;
+            }
+            let output =
+                command_output(
+                    self.command("sh")?
+                        .args(["-c", "command -v \"$1\"", "sh", tool]),
+                )?;
+            if output.status.success() {
+                commands.push((tool, String::from_utf8(output.stdout)?.trim().to_owned()));
+            }
+        }
+        fs::create_dir(&destination)?;
+        for (tool, source) in commands {
+            std::os::unix::fs::symlink(source, destination.join(tool))?;
+        }
+        Ok(())
+    }
+
+    fn cachyos(&self) -> Result<()> {
+        let path = self.root.join("os-release");
+        fs::write(&path, "ID=cachyos\nID_LIKE=arch\nPRETTY_NAME=CachyOS\n")?;
+        fs::write(
+            &self.script,
+            fs::read_to_string(&self.script)?.replace("/etc/os-release", path.to_str().unwrap()),
+        )?;
+        Ok(())
     }
 
     fn run_with_cert(&self, status: &str, certificate: Option<&Path>) -> Result<Output> {
@@ -269,6 +350,239 @@ fn mock_inaccessible_tss_device(fixture: &InstallerFixture) -> Result<()> {
     Ok(())
 }
 
+fn mock_ek_recovery(fixture: &InstallerFixture, vendor: &str) -> Result<()> {
+    fs::write(fixture.root.join("needs-ek"), "")?;
+    fs::write(
+        fixture.root.join("tpm-properties"),
+        format!("TPM2_PT_MANUFACTURER:\n  raw: {vendor}\n"),
+    )?;
+    executable(
+        &fixture.mocks.join("tpm2_getcap"),
+        r#"#!/bin/sh
+[ "$*" = '-T device:/dev/tpmrm0 properties-fixed' ] || exit 1
+cat "$MYSYNC_TEST_ROOT/tpm-properties"
+"#,
+    )?;
+    executable(
+        &fixture.mocks.join("tpm2_createek"),
+        r#"#!/bin/sh
+[ "$#" = 8 ] && [ "$1" = -T ] && [ "$2" = device:/dev/tpmrm0 ] && [ "$3" = -G ] && [ "$5" = -u ] && [ "$7" = -c ] || exit 1
+printf '%s\n' "$4" > "$6"
+: > "$8"
+"#,
+    )?;
+    executable(
+        &fixture.mocks.join("tpm2_getekcertificate"),
+        r#"#!/bin/sh
+# Exact options exclude TLS bypass, arbitrary hosts and TPM hierarchy changes.
+[ "$#" = 6 ] && [ "$1" = -T ] && [ "$2" = device:/dev/tpmrm0 ] && [ "$3" = -u ] && [ "$5" = -o ] || exit 1
+printf '%s\n' "$(cat "$4")" >> "$MYSYNC_TEST_ROOT/ek-downloads"
+[ ! -e "$MYSYNC_TEST_ROOT/download-fails" ] || exit 1
+if [ -e "$MYSYNC_TEST_ROOT/rsa-fails" ] && [ "$(cat "$4")" = rsa ]; then exit 1; fi
+if [ -e "$MYSYNC_TEST_ROOT/download-mismatch" ]; then
+    printf wrong-certificate > "$6"
+elif [ -e "$MYSYNC_TEST_ROOT/download-oversized" ]; then
+    python3 -c 'import pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(b"x" * 20000)' "$6"
+else
+    printf valid-test-certificate > "$6"
+fi
+"#,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn installer_recovers_and_reuses_an_amd_ek_certificate() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    fixture.cachyos()?;
+    mock_ek_recovery(&fixture, "0x414D4400")?;
+    let output = fixture.run_interactive_with_input("0", false, b"y\n\n\n")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(transcript.contains("TPM manufacturer: AMD"), "{transcript}");
+    assert!(
+        transcript.contains("identifier derived from this TPM"),
+        "{transcript}"
+    );
+    let cache = fixture.home.join(".config/mysync/ek.der");
+    assert_eq!(fs::read_to_string(&cache)?, "valid-test-certificate");
+    assert_eq!(fs::metadata(&cache)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(cache.parent().unwrap())?.permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(
+        fs::read_to_string(fixture.root.join("setup-called"))?
+            .contains(&format!("--ek-cert {}", cache.display()))
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("ek-downloads"))?,
+        "rsa\n"
+    );
+    let output = fixture.run("200")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Saved TPM certificate verified"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("--ek-cert {}", cache.display()))
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("ek-downloads"))?,
+        "rsa\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn installer_recovers_an_intel_ek_and_falls_back_to_ecc() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    mock_ek_recovery(&fixture, "0x494E5443")?;
+    fs::write(fixture.root.join("rsa-fails"), "")?;
+    let output = fixture.run_interactive_with_input("0", false, b"y\n\n\n")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("TPM manufacturer: Intel"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("ek-downloads"))?,
+        "rsa\necc\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn installer_never_downloads_a_certificate_without_consent() -> Result<()> {
+    for interactive in [false, true] {
+        let fixture = InstallerFixture::new(true)?;
+        mock_ek_recovery(&fixture, "0x414D4400")?;
+        let output = if interactive {
+            fixture.run_interactive_with_input("0", false, b"n\n")?
+        } else {
+            fixture.run("200")?
+        };
+        assert!(!output.status.success());
+        assert!(!fixture.root.join("ek-downloads").exists());
+        assert!(!fixture.home.join(".config/mysync/ek.der").exists());
+        fixture.assert_not_installed();
+    }
+    Ok(())
+}
+
+#[test]
+fn installer_preserves_a_saved_certificate_after_failed_recovery() -> Result<()> {
+    for failure in ["download-fails", "download-mismatch", "download-oversized"] {
+        let fixture = InstallerFixture::new(true)?;
+        mock_ek_recovery(&fixture, "0x414D4400")?;
+        safe_directory(fixture.home.join(".config/mysync"))?;
+        let cache = fixture.home.join(".config/mysync/ek.der");
+        fs::write(&cache, "old-certificate")?;
+        fs::write(fixture.root.join(failure), "")?;
+        let output = fixture.run_interactive_with_input("0", false, b"y\n")?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("Could not retrieve a certificate matching this TPM")
+        );
+        assert_eq!(fs::read_to_string(cache)?, "old-certificate");
+        fixture.assert_not_installed();
+    }
+    Ok(())
+}
+
+#[test]
+fn installer_guides_other_manufacturers_and_rejects_symlink_caches() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    mock_ek_recovery(&fixture, "0x49465800")?;
+    let output = fixture.run("200")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("MYSYNC_EK_CERT=/path/to/ek.der"));
+    assert!(!fixture.root.join("ek-downloads").exists());
+    fixture.assert_not_installed();
+
+    let fixture = InstallerFixture::new(true)?;
+    mock_ek_recovery(&fixture, "0x414D4400")?;
+    safe_directory(fixture.home.join(".config/mysync"))?;
+    let outside = fixture.root.join("outside-certificate");
+    fs::write(&outside, "keep")?;
+    std::os::unix::fs::symlink(&outside, fixture.home.join(".config/mysync/ek.der"))?;
+    let output = fixture.run("200")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe saved TPM certificate"));
+    assert_eq!(fs::read_to_string(outside)?, "keep");
+    fixture.assert_not_installed();
+    Ok(())
+}
+
+#[test]
+fn installer_offers_missing_tpm_tools_on_cachyos_and_resumes() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    fixture.cachyos()?;
+    mock_ek_recovery(&fixture, "0x414D4400")?;
+    let templates = fixture.root.join("tool-templates");
+    fs::create_dir(&templates)?;
+    for tool in ["tpm2_getcap", "tpm2_createek", "tpm2_getekcertificate"] {
+        fs::copy(fixture.mocks.join(tool), templates.join(tool))?;
+    }
+    executable(
+        &fixture.mocks.join("sudo"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$MYSYNC_TEST_ROOT/package-installs"
+[ "$*" = 'pacman -S --needed tpm2-tools' ] || exit 1
+cp "$MYSYNC_TEST_ROOT/tool-templates/"* "$MYSYNC_TEST_INSTALL_BIN/"
+"#,
+    )?;
+    fixture.without_tools(&["tpm2_getcap", "tpm2_createek", "tpm2_getekcertificate"])?;
+    let output = fixture.run("200")?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sudo pacman -S --needed tpm2-tools"));
+    assert!(!fixture.root.join("package-installs").exists());
+    let output = fixture.run_interactive_with_input("0", false, b"n\n")?;
+    assert!(!output.status.success());
+    assert!(!fixture.root.join("package-installs").exists());
+    assert!(!fixture.root.join("ek-downloads").exists());
+    fixture.assert_not_installed();
+    let output = fixture.run_interactive_with_input("0", false, b"y\ny\n\n\n")?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("package-installs"))?,
+        "pacman -S --needed tpm2-tools\n"
+    );
+    assert!(fixture.root.join("setup-called").exists());
+    Ok(())
+}
+
+#[test]
+fn installer_detects_missing_base_tools_before_downloading() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    fixture.cachyos()?;
+    fixture.without_tools(&["python3", "curl", "flock"])?;
+    let output = fixture.run("200")?;
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("sudo pacman -S --needed curl python util-linux"),
+        "{error}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("Downloading signed release metadata")
+    );
+    fixture.assert_not_installed();
+    Ok(())
+}
+
 #[test]
 fn installer_guides_tss_membership_without_an_interactive_terminal() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
@@ -330,7 +644,7 @@ fn installer_offers_tss_group_update_in_a_terminal() -> Result<()> {
 #[test]
 fn signed_installer_accepts_explicit_ek_certificate() -> Result<()> {
     let fixture = InstallerFixture::new(true)?;
-    let certificate = fixture.root.join("ek.der");
+    let certificate = fixture.root.join("ek certificate.der");
     fs::write(&certificate, b"test certificate path")?;
     let output = fixture.run_with_cert("200", Some(&certificate))?;
     assert!(
@@ -339,6 +653,10 @@ fn signed_installer_accepts_explicit_ek_certificate() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(fixture.home.join(".local/bin/mysync").exists());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("--ek-cert '{}'", certificate.display()))
+    );
     Ok(())
 }
 
@@ -737,10 +1055,34 @@ fn signed_installer_rejects_bad_signature_binary_and_tpm() -> Result<()> {
 
 #[test]
 fn signed_installer_rejects_redirects_and_missing_releases() -> Result<()> {
-    for status in ["302", "404"] {
+    for (status, curl_exit) in [
+        ("302", "0"),
+        ("404", "0"),
+        ("404", "22"),
+        ("500", "22"),
+        ("000", "7"),
+    ] {
         let fixture = InstallerFixture::new(true)?;
-        let output = fixture.run(status)?;
+        let output = command_output(
+            fixture
+                .command("sh")?
+                .arg(&fixture.script)
+                .env("MYSYNC_TEST_HTTP_STATUS", status)
+                .env("MYSYNC_TEST_CURL_EXIT", curl_exit),
+        )?;
         assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        if status == "404" {
+            assert!(
+                error.contains("Signed release metadata is unavailable"),
+                "{error}"
+            );
+            assert!(error.contains("latest-"), "{error}");
+            assert!(error.contains("docs/releases.md"), "{error}");
+        } else if curl_exit != "0" {
+            assert!(error.contains("Download failed:"), "{error}");
+            assert!(!error.contains("repository maintainer"), "{error}");
+        }
         fixture.assert_not_installed();
     }
     Ok(())
