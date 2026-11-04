@@ -6,12 +6,14 @@ help:
 test:
 	sh -n deploy/install.sh
 	bash -n deploy/install-client.sh
+	bash -n deploy/install-tpm-deps.sh
 	cargo fmt --all -- --check
 	cargo test --locked --no-default-features --jobs $(MYSYNC_CARGO_JOBS)
 build:
 	cargo build --locked --release --features tpm --jobs $(MYSYNC_CARGO_JOBS)
 test-tpm:
 	cargo test --locked --features tpm --jobs $(MYSYNC_CARGO_JOBS)
+	cargo test --locked --features tpm --test tpm_portability --jobs $(MYSYNC_CARGO_JOBS) -- --ignored
 install:
 	bash deploy/install-client.sh
 clean:

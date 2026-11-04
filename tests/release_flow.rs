@@ -14,6 +14,11 @@ use std::{
     time::Duration,
 };
 
+// Other test processes can inherit a writable executable descriptor between
+// fork and exec, briefly causing ETXTBSY in publication/version probes.
+// Serialize these fixtures while preserving each test's own update race.
+static EXECUTABLE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn executable(path: &Path, version: &str) -> Result<()> {
     std::fs::write(
         path,
@@ -27,6 +32,7 @@ fn executable(path: &Path, version: &str) -> Result<()> {
 
 #[test]
 fn publishing_rejects_a_client_without_setup() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.blocking_lock();
     let temp = tempfile::tempdir()?;
     let signing_key = temp.path().join("signing.key");
     release::generate_key(&signing_key)?;
@@ -52,6 +58,7 @@ fn publishing_rejects_a_client_without_setup() -> Result<()> {
 
 #[test]
 fn publishing_requires_a_new_version_for_a_changed_binary() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.blocking_lock();
     let temp = tempfile::tempdir()?;
     let key = temp.path().join("signing.key");
     release::generate_key(&key)?;
@@ -84,6 +91,7 @@ fn publishing_requires_a_new_version_for_a_changed_binary() -> Result<()> {
 
 #[tokio::test]
 async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.lock().await;
     use axum::{Router, routing::get};
     let temp = tempfile::tempdir()?;
     let key = temp.path().join("key");
@@ -210,6 +218,7 @@ async fn delayed_older_signed_update_cannot_replace_a_newer_installation() -> Re
 
 #[tokio::test]
 async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.lock().await;
     use std::os::unix::fs::PermissionsExt;
     for incompatible in ["exit 127", "printf 'mysync 0.0.0\\n'"] {
         let temp = tempfile::tempdir()?;
@@ -281,6 +290,7 @@ async fn update_keeps_installed_client_when_signed_candidate_cannot_run() -> Res
 
 #[tokio::test]
 async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.lock().await;
     let temp = tempfile::tempdir()?;
     let signing_key = temp.path().join("signing.key");
     let public_key = release::generate_key(&signing_key)?;
@@ -378,6 +388,7 @@ async fn signed_release_is_served_and_installed_atomically() -> Result<()> {
 #[tokio::test]
 async fn update_reports_the_actual_published_version_without_replacing_current_clients()
 -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.lock().await;
     let temp = tempfile::tempdir()?;
     let key = temp.path().join("signing.key");
     let public_key = release::generate_key(&key)?;
@@ -413,6 +424,7 @@ async fn update_reports_the_actual_published_version_without_replacing_current_c
 
 #[tokio::test]
 async fn update_rejects_unsigned_metadata() -> Result<()> {
+    let _fixture_guard = EXECUTABLE_TESTS.lock().await;
     let temp = tempfile::tempdir()?;
     let signing_key = temp.path().join("signing.key");
     let public_key = release::generate_key(&signing_key)?;

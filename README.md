@@ -47,12 +47,15 @@ Les réponses du serveur et les fichiers sont authentifiés contre sa clé épin
 
 ```sh
 make test             # sans pilote ni simulateur TPM
-./deploy/install-tpm-deps.sh
+./deploy/install-tpm-deps.sh --build  # outils et en-têtes natifs pour compiler
 make build            # client opérationnel avec TPM
+make test-tpm         # pilote et tests isolés avec swtpm + tpm2-tools
 MYSYNC_PROFILE=maison make install  # active le service utilisateur
 ```
 
 `make test` comprend l’installateur, les profils, les transferts HTTP simulés, les mises à jour signées et les vérifications du miroir. Le mode `--no-default-features` sert aux tests et refuse les opérations TPM. Les builds habituels et `make build` activent le pilote matériel.
+
+Le choix du TPM repose sur les périphériques et capacités, indépendamment du processeur AMD ou Intel. Les modèles et nonces EK constructeur des profils RSA-2048/P-256 sont lus lorsqu’ils existent. Voir les [capacités requises, transports et limites](docs/install-client.md#compatibilité-tpm-et-limites). La découverte des intermédiaires Intel fonctionne également sans chaîne NV embarquée.
 
 Le paquet `mysync-protocol` vient d’une révision Git précise du dépôt serveur. Avant publication, exécuter aussi `make test-integration` dans ce dépôt, avec le client voisin à la révision indiquée dans `integration/client-revision`, puis les scénarios Debian 13 et Arch. L’historique de ce dépôt a été extrait des fichiers clients de MySyncFiles ; la licence GPL-3.0-only et les auteurs sont conservés.
 

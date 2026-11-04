@@ -28,6 +28,9 @@ struct Cli {
 enum Command {
     /// Pair this client with an administrator, then verify the first sync
     Setup {
+        /// TPM transport for machines with several TPMs (e.g. device:/dev/tpmrm1)
+        #[arg(long)]
+        tcti: Option<String>,
         #[arg(long)]
         server: String,
         /// Origin key obtained directly from the administrator (prompts if omitted)
@@ -45,12 +48,18 @@ enum Command {
     },
     /// Check TPM 2.0 access and an EK certificate without enrolling
     Doctor {
+        /// TPM transport (defaults to the Linux resource manager)
+        #[arg(long)]
+        tcti: Option<String>,
         /// Manufacturer EK leaf certificate in DER when absent from TPM NV
         #[arg(long)]
         ek_cert: Option<PathBuf>,
     },
     /// Enroll a TPM identity; administrator approval is required before activation
     Enroll {
+        /// TPM transport, saved with the identity for subsequent requests
+        #[arg(long)]
+        tcti: Option<String>,
         #[arg(long)]
         server: String,
         /// Origin key obtained directly from the administrator
@@ -193,13 +202,15 @@ async fn main() -> Result<()> {
         }
         return client::profiles::daemon_all().await;
     }
-    if let Command::Doctor { ek_cert } = &cli.command {
+    if let Command::Doctor { ek_cert, tcti } = &cli.command {
         let certificate = ek_cert
             .as_deref()
             .map(mysyncfiles_client::tpm::read_ek_certificate)
             .transpose()?;
         let kind = mysyncfiles_client::tpm::doctor_with_certificate(
-            &mysyncfiles_client::tpm::default_tcti(),
+            &tcti
+                .clone()
+                .unwrap_or_else(mysyncfiles_client::tpm::default_tcti),
             certificate.as_deref(),
         )?;
         println!("TPM 2.0 is reachable and the {kind} EK matches its certificate.");
@@ -233,6 +244,7 @@ async fn main() -> Result<()> {
     let config_path = client::profiles::selected(cli.profile.as_deref(), cli.config)?;
     match cli.command {
         Command::Setup {
+            tcti,
             server,
             server_public_key,
             dir,
@@ -250,7 +262,7 @@ async fn main() -> Result<()> {
                     ek_cert,
                     ek_chain,
                     web_status_enabled: web_status,
-                    ..client::SetupOptions::default()
+                    tcti,
                 },
             )
             .await?;
@@ -265,6 +277,7 @@ async fn main() -> Result<()> {
         }
         Command::Doctor { .. } => unreachable!(),
         Command::Enroll {
+            tcti,
             server,
             server_public_key,
             dir,
@@ -278,7 +291,7 @@ async fn main() -> Result<()> {
             } else {
                 rpassword::prompt_password("Enrollment invitation: ")?
             };
-            let result = client::enroll(
+            let result = client::enroll_with_tcti(
                 &config_path,
                 server,
                 key,
@@ -286,6 +299,7 @@ async fn main() -> Result<()> {
                 invitation,
                 ek_cert,
                 ek_chain,
+                tcti.unwrap_or_else(mysyncfiles_client::tpm::default_tcti),
             )
             .await?;
             println!(

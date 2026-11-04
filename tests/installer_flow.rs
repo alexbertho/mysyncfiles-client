@@ -237,6 +237,7 @@ printf 200
             "tpm2_createek",
             "tpm2_getcap",
             "tpm2_getekcertificate",
+            "tpm2_flushcontext",
             "uname",
         ] {
             if missing.contains(&tool) {
@@ -351,6 +352,14 @@ fn mock_inaccessible_tss_device(fixture: &InstallerFixture) -> Result<()> {
 }
 
 fn mock_ek_recovery(fixture: &InstallerFixture, vendor: &str) -> Result<()> {
+    executable(
+        &fixture.mocks.join("tpm2_flushcontext"),
+        r#"#!/bin/sh
+[ "$#" = 3 ] && [ "$1" = -T ] && [ "$2" = device:/dev/tpmrm0 ] || exit 1
+case "$3" in */ek-rsa.ctx|*/ek-ecc.ctx) ;; *) exit 1 ;; esac
+printf '%s\n' "$3" >> "$MYSYNC_TEST_ROOT/flushed-contexts"
+"#,
+    )?;
     fs::write(fixture.root.join("needs-ek"), "")?;
     fs::write(
         fixture.root.join("tpm-properties"),
@@ -1174,6 +1183,49 @@ fn installer_rejects_invalid_origins_even_with_an_explicit_profile() -> Result<(
         )?;
         assert!(!fixture.run("200")?.status.success());
         fixture.assert_not_installed();
+    }
+    Ok(())
+}
+
+#[test]
+fn tpm_dependency_installer_includes_source_build_headers() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    executable(
+        &fixture.mocks.join("sudo"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MYSYNC_TEST_ROOT/dependency-packages\"\n",
+    )?;
+    let template = include_str!("../deploy/install-tpm-deps.sh");
+    for (debian, arch, expected) in [
+        (
+            true,
+            false,
+            "build-essential pkg-config libssl-dev libtss2-dev",
+        ),
+        (false, true, "base-devel pkgconf"),
+    ] {
+        let script = template
+            .replace(
+                "if [[ -r /etc/debian_version ]]; then",
+                if debian {
+                    "if true; then"
+                } else {
+                    "if false; then"
+                },
+            )
+            .replace(
+                "elif [[ -r /etc/arch-release ]]; then",
+                if arch {
+                    "elif true; then"
+                } else {
+                    "elif false; then"
+                },
+            )
+            .replace("if [[ ! -e /dev/tpmrm0 ]]; then", "if true; then");
+        let path = fixture.root.join("deps.sh");
+        fs::write(&path, script)?;
+        let output = command_output(fixture.command("bash")?.arg(&path).arg("--build"))?;
+        assert!(!output.status.success()); // Expected: no TPM in this fixture.
+        assert!(fs::read_to_string(fixture.root.join("dependency-packages"))?.contains(expected));
     }
     Ok(())
 }

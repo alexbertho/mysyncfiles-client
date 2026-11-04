@@ -113,10 +113,12 @@ where
     F: FnMut(reqwest::Url) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>>>,
 {
-    let amd = ca_issuer_uri(leaf)?
-        .and_then(|uri| reqwest::Url::parse(&uri).ok())
-        .is_some_and(|url| url.host_str() == Some("ftpm.amd.com"));
-    if embedded.is_empty() && !amd {
+    // Start with the leaf for both Intel and AMD, including TPMs without
+    // embedded issuers. Other manufacturers can supply --ek-chain; the server
+    // remains the sole authority for trust in every case.
+    if embedded.is_empty()
+        && !ca_issuer_uri(leaf)?.is_some_and(|uri| allowed_ek_ca_issuer_url(&uri).is_ok())
+    {
         return Ok(Vec::new());
     }
     let mut remaining = embedded;
@@ -142,9 +144,11 @@ where
         let der = if let Some(position) = position {
             remaining.remove(position)
         } else {
-            let uri = ca_issuer_uri(&current.to_der()?)?.context(
-                "TPM EK issuer is absent from the embedded chain and has no CA Issuers URL; supply --ek-chain with the manufacturer intermediates",
-            )?;
+            let Some(uri) = ca_issuer_uri(&current.to_der()?)? else {
+                // A partial chain may end at a server-configured trust anchor.
+                // Only the server can decide whether it is sufficient.
+                break;
+            };
             fetch(allowed_ek_ca_issuer_url(&uri)?).await?
         };
         let issuer = openssl::x509::X509::from_der(&der)?;
@@ -553,7 +557,7 @@ pub async fn enroll_with_tcti(
                     .map(|(identity, _)| identity)
             } else {
                 crate::tpm::Identity::create(&tcti, "rsa")
-                    .or_else(|_| crate::tpm::Identity::create(&tcti, "ecc"))
+                    .or_else(|rsa| crate::tpm::Identity::create(&tcti, "ecc").map_err(|ecc| anyhow!("no usable manufacturer EK profile; RSA-2048: {rsa:#}; P-256: {ecc:#}")))
                     .map(|(identity, _)| identity)
             }
         })
@@ -747,13 +751,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intel_without_an_embedded_chain_does_not_start_aia_discovery() -> Result<()> {
+    async fn intel_without_embedded_issuers_attempts_manufacturer_discovery() -> Result<()> {
         let certificate = include_bytes!("../../tests/fixtures/intel-odca-ca2.der");
-        let chain = complete_ek_chain_with_fetch(certificate, Vec::new(), |_| async {
-            panic!("unexpected certificate request")
+        let mut requested = false;
+        let error = complete_ek_chain_with_fetch(certificate, Vec::new(), |url| {
+            requested = true;
+            assert_eq!(url.host_str(), Some("tsci.intel.com"));
+            async { bail!("test network unavailable") }
         })
-        .await?;
-        assert!(chain.is_empty());
+        .await
+        .unwrap_err();
+        assert!(requested);
+        assert!(error.to_string().contains("test network unavailable"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn intel_chain_is_completed_without_nv_and_rejects_another_issuer() -> Result<()> {
+        let certificate = include_bytes!("../../tests/fixtures/intel-odca-ca2.der");
+        let root = include_bytes!("../../tests/fixtures/intel-odca-root.der");
+        let chain =
+            complete_ek_chain_with_fetch(certificate, Vec::new(), |_| async { Ok(root.to_vec()) })
+                .await?;
+        assert_eq!(chain, vec![root.to_vec()]);
+        assert!(
+            complete_ek_chain_with_fetch(certificate, Vec::new(), |_| async {
+                Ok(include_bytes!("../../tests/fixtures/amd-tpm-rsa-root.der").to_vec())
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not sign its child")
+        );
         Ok(())
     }
 }
