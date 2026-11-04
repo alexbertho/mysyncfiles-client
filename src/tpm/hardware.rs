@@ -1,4 +1,4 @@
-use super::{Identity, default_tcti};
+use super::Identity;
 use crate::auth_protocol::{Claims, EnrollChallenge, Proof};
 use anyhow::{Context as _, Result, bail, ensure};
 use openssl::bn::{BigNum, BigNumContext};
@@ -10,7 +10,7 @@ use tss_esapi::{
     Context, TctiNameConf,
     abstraction::{AsymmetricAlgorithmSelection, ek, nv},
     attributes::{ObjectAttributesBuilder, SessionAttributesBuilder},
-    constants::SessionType,
+    constants::{CapabilityType, PropertyTag, SessionType},
     handles::{AuthHandle, KeyHandle, NvIndexTpmHandle, SessionHandle},
     interface_types::{
         algorithm::{EccSchemeAlgorithm, HashingAlgorithm, PublicAlgorithm},
@@ -20,9 +20,9 @@ use tss_esapi::{
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        EccPoint, EccScheme, KeyDerivationFunctionScheme, Private, Public, PublicBuilder,
-        PublicEccParametersBuilder, Signature, SignatureScheme, SymmetricDefinition,
-        SymmetricDefinitionObject,
+        CapabilityData, EccParameter, EccPoint, EccScheme, KeyDerivationFunctionScheme, Private,
+        Public, PublicBuilder, PublicEccParametersBuilder, PublicKeyRsa, PublicParameters,
+        Signature, SignatureScheme, SymmetricDefinition, SymmetricDefinitionObject,
     },
     traits::{Marshall, UnMarshall},
 };
@@ -141,8 +141,14 @@ fn algorithm(kind: &str) -> Result<AsymmetricAlgorithmSelection> {
     }
 }
 fn context(tcti: &str) -> Result<Context> {
-    Context::new(TctiNameConf::from_str(tcti)?)
-        .context("opening TPM 2.0; check /dev/tpmrm0 access and TPM dependencies")
+    let mut ctx = Context::new(TctiNameConf::from_str(tcti)?).with_context(|| {
+        format!("opening TPM 2.0 through {tcti}; check device permissions and TPM dependencies")
+    })?;
+    ensure!(
+        ctx.get_tpm_property(PropertyTag::FamilyIndicator)? == Some(0x322e3000),
+        "a TPM 2.0 is required"
+    );
+    Ok(ctx)
 }
 
 const MAX_EK_CERT_BYTES: u64 = 16 * 1024;
@@ -150,6 +156,140 @@ const INTEL_EK_CHAIN_NV_INDEX: u32 = 0x01c00100;
 const INTEL_EK_CHAIN_NV_LAST_INDEX: u32 = 0x01c001ff;
 const MAX_EK_CHAIN_NV_BYTES: usize = 128 * 1024;
 const MAX_EK_CHAIN_NV_CERTIFICATES: usize = 64;
+
+/// Query only the requested index. Enumerating every NV public area can fail
+/// on unrelated OS-owned indices and is unnecessary for EK discovery.
+fn read_nv(ctx: &mut Context, number: u32, limit: usize) -> Result<Option<Vec<u8>>> {
+    let index = NvIndexTpmHandle::new(number)?;
+    let (capability, _) =
+        ctx.execute_without_session(|ctx| ctx.get_capability(CapabilityType::Handles, number, 1))?;
+    let CapabilityData::Handles(handles) = capability else {
+        bail!("TPM returned invalid NV capabilities");
+    };
+    if handles.first().copied() != Some(index.into()) {
+        return Ok(None);
+    }
+    let handle = ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(index.into()))?;
+    let (public, _) = ctx.execute_without_session(|ctx| ctx.nv_read_public(handle.into()))?;
+    ensure!(
+        public.data_size() > 0 && public.data_size() <= limit,
+        "TPM NV index {number:#010x} is empty or too large"
+    );
+    // Public manufacturer certificates normally use empty index authorization.
+    // Prefer it over owner authorization, which the OS may have provisioned.
+    let auth = if public.attributes().auth_read() {
+        NvAuth::NvIndex(handle.into())
+    } else if public.attributes().owner_read() {
+        NvAuth::Owner
+    } else {
+        bail!(
+            "TPM NV index {number:#010x} requires an unsupported authorization policy; supply manufacturer certificates externally"
+        );
+    };
+    let bytes = ctx
+        .execute_with_nullauth_session(|ctx| nv::read_full(ctx, auth, index))
+        .with_context(|| format!("reading TPM NV index {number:#010x}; its authorization may be provisioned by the OS"))?;
+    ensure!(bytes.len() == public.data_size(), "TPM NV size changed");
+    Ok(Some(bytes))
+}
+
+fn ek_indices(alg: AsymmetricAlgorithmSelection) -> Result<(u32, u32, u32)> {
+    match alg {
+        AsymmetricAlgorithmSelection::Rsa(RsaKeyBits::Rsa2048) => {
+            Ok((0x01c00002, 0x01c00003, 0x01c00004))
+        }
+        AsymmetricAlgorithmSelection::Ecc(EccCurve::NistP256) => {
+            Ok((0x01c0000a, 0x01c0000b, 0x01c0000c))
+        }
+        _ => bail!("only RSA-2048 and P-256 EK profiles are supported by the server protocol"),
+    }
+}
+
+fn ek_certificate(ctx: &mut Context, alg: AsymmetricAlgorithmSelection) -> Result<Vec<u8>> {
+    let (index, _, _) = ek_indices(alg)?;
+    read_nv(ctx, index, MAX_EK_CERT_BYTES as usize)?
+        .context("TPM has no manufacturer EK certificate; supply --ek-cert with a manufacturer DER certificate")
+}
+
+/// TCG low-range EK profiles permit a manufacturer template and nonce in NV.
+/// Keep the supported policy/parameters unchanged, allowing only the unique
+/// seed to differ. Never silently ignore a present but invalid template.
+fn endorsement_template(ctx: &mut Context, alg: AsymmetricAlgorithmSelection) -> Result<Public> {
+    let (_, nonce_index, template_index) = ek_indices(alg)?;
+    let default = ek::create_ek_public_from_default_template_2(alg, None)?;
+    let template = read_nv(ctx, template_index, 2048)?;
+    let mut public = if let Some(bytes) = template {
+        let public = Public::unmarshall(&bytes).context("invalid manufacturer EK template")?;
+        ensure!(
+            public.marshall()? == bytes,
+            "trailing data in manufacturer EK template"
+        );
+        public
+    } else {
+        default.clone()
+    };
+    validate_ek_template(&public, &default)?;
+    if let Some(nonce) = read_nv(ctx, nonce_index, 256)? {
+        match &mut public {
+            Public::Rsa { unique, .. } => {
+                ensure!(nonce.len() <= 256, "RSA EK nonce is too large");
+                let mut bytes = vec![0; 256];
+                bytes[..nonce.len()].copy_from_slice(&nonce);
+                *unique = PublicKeyRsa::try_from(bytes)?;
+            }
+            Public::Ecc { unique, .. } => {
+                ensure!(nonce.len() <= 32, "P-256 EK nonce is too large");
+                let mut bytes = vec![0; 32];
+                bytes[..nonce.len()].copy_from_slice(&nonce);
+                *unique = EccPoint::new(
+                    EccParameter::try_from(bytes)?,
+                    EccParameter::try_from(vec![0; 32])?,
+                );
+            }
+            _ => bail!("unsupported EK template"),
+        }
+    }
+    Ok(public)
+}
+
+fn validate_ek_template(public: &Public, default: &Public) -> Result<()> {
+    let mut normalized = public.clone();
+    match (&mut normalized, default) {
+        (
+            Public::Rsa { unique, .. },
+            Public::Rsa {
+                unique: expected, ..
+            },
+        ) => *unique = expected.clone(),
+        (
+            Public::Ecc { unique, .. },
+            Public::Ecc {
+                unique: expected, ..
+            },
+        ) => *unique = expected.clone(),
+        _ => bail!("manufacturer EK template has an unsupported algorithm"),
+    }
+    ensure!(
+        normalized == *default,
+        "manufacturer EK template requires unsupported parameters or policy; RSA-2048/P-256 with SHA-256 PolicySecret and AES-128-CFB is required"
+    );
+    Ok(())
+}
+
+fn endorsement_key(ctx: &mut Context, alg: AsymmetricAlgorithmSelection) -> Result<KeyHandle> {
+    let public = endorsement_template(ctx, alg)?;
+    Ok(ctx.execute_with_nullauth_session(|ctx| {
+        ctx.create_primary(Hierarchy::Endorsement, public, None, None, None, None)
+    }).context("creating the TPM endorsement key; a provisioned endorsement hierarchy password is not supported")?.key_handle)
+}
+
+fn signing_capabilities(ctx: &mut Context) -> Result<()> {
+    let Public::Ecc { parameters, .. } = signing_template()? else {
+        unreachable!()
+    };
+    ctx.execute_without_session(|ctx| ctx.test_parms(PublicParameters::Ecc(parameters)))
+        .context("TPM does not support the protocol's required ECDSA P-256/SHA-256 identity; no software key fallback is permitted")
+}
 
 /// Intel PTT may store its per-device issuing certificates as concatenated DER
 /// across the TCG EK chain NV index range. Treat the bytes as untrusted: the
@@ -257,8 +397,7 @@ fn matching_ek(
         "EK certificate must contain exactly one canonical DER certificate"
     );
     let key = cert.public_key()?;
-    let parent =
-        ek::create_ek_object_2(ctx, alg, None).context("creating the TPM endorsement key")?;
+    let parent = endorsement_key(ctx, alg).context("creating the TPM endorsement key")?;
     let (public, _, _) = ctx.read_public(parent)?;
     match public {
         Public::Rsa {
@@ -314,39 +453,48 @@ pub fn doctor(tcti: &str) -> Result<&'static str> {
 }
 
 pub fn doctor_with_certificate(tcti: &str, external: Option<&[u8]>) -> Result<&'static str> {
-    if tcti == default_tcti() {
-        let device = Path::new("/dev/tpmrm0");
+    if let Some(path) = tcti.strip_prefix("device:") {
+        let device = Path::new(path);
         if !device.exists() {
-            bail!("TPM 2.0 is unavailable: /dev/tpmrm0 is missing; enable the TPM in firmware");
+            bail!(
+                "TPM 2.0 is unavailable: {path} is missing; enable the TPM in firmware or select its resource manager with --tcti"
+            );
         }
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(device)
-            .context(
-                "cannot access /dev/tpmrm0; check TPM device permissions and your group membership",
-            )?;
+            .with_context(|| {
+                format!(
+                    "cannot access {path}; check TPM device permissions and your group membership"
+                )
+            })?;
     }
     let mut ctx = context(tcti)?;
+    signing_capabilities(&mut ctx)?;
     if let Some(certificate) = external {
         let kind = certificate_kind(certificate)?;
         matching_ek(&mut ctx, algorithm(kind)?, certificate)?;
         return Ok(kind);
     }
-    for (kind, selection) in [
-        (
-            "rsa",
-            AsymmetricAlgorithmSelection::Rsa(RsaKeyBits::Rsa2048),
-        ),
-        ("ecc", AsymmetricAlgorithmSelection::Ecc(EccCurve::NistP256)),
-    ] {
-        if let Ok(certificate) = ek::retrieve_ek_pubcert(&mut ctx, selection)
-            && matching_ek(&mut ctx, selection, &certificate).is_ok()
-        {
-            return Ok(kind);
+    let mut failures = Vec::new();
+    for kind in ["rsa", "ecc"] {
+        let result = (|| {
+            let selection = algorithm(kind)?;
+            let certificate = ek_certificate(&mut ctx, selection)?;
+            let parent = matching_ek(&mut ctx, selection, &certificate)?;
+            ctx.flush_context(parent.into())?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        match result {
+            Ok(()) => return Ok(kind),
+            Err(error) => failures.push(format!("{kind}: {error:#}")),
         }
     }
-    bail!("TPM 2.0 is reachable, but no readable RSA-2048 or P-256 EK certificate was found")
+    bail!(
+        "TPM 2.0 is reachable, but no readable RSA-2048 or P-256 EK certificate was found; {}",
+        failures.join("; ")
+    )
 }
 
 /// The low-range RSA-2048 and P-256 EK profiles both use SHA-256 PolicySecret.
@@ -417,36 +565,11 @@ impl Identity {
     /// index range. A missing first index is normal for TPMs without a chain.
     pub fn ek_intermediates(&self) -> Result<Vec<Vec<u8>>> {
         let mut ctx = context(&self.tcti)?;
-        let indices = nv::list(&mut ctx)?;
         let mut bytes = Vec::new();
         for number in INTEL_EK_CHAIN_NV_INDEX..=INTEL_EK_CHAIN_NV_LAST_INDEX {
-            let index = NvIndexTpmHandle::new(number)?;
-            let Some((public, _)) = indices
-                .iter()
-                .find(|(public, _)| public.nv_index() == index)
-            else {
+            let Some(part) = read_nv(&mut ctx, number, MAX_EK_CHAIN_NV_BYTES - bytes.len())? else {
                 break;
             };
-            ensure!(
-                public.data_size() > 0 && public.data_size() <= MAX_EK_CHAIN_NV_BYTES - bytes.len(),
-                "TPM EK chain NV indices are empty or too large"
-            );
-            let auth = if public.attributes().owner_read() {
-                NvAuth::Owner
-            } else if public.attributes().auth_read() {
-                let handle =
-                    ctx.execute_without_session(|ctx| ctx.tr_from_tpm_public(index.into()))?;
-                NvAuth::NvIndex(handle.into())
-            } else {
-                bail!("TPM EK chain NV index is not readable without a hierarchy password");
-            };
-            let part = ctx
-                .execute_with_nullauth_session(|ctx| nv::read_full(ctx, auth, index))
-                .with_context(|| format!("reading TPM EK chain NV index {number:#010x}"))?;
-            ensure!(
-                part.len() == public.data_size(),
-                "TPM EK chain NV index size changed during reading"
-            );
             bytes.extend_from_slice(&part);
         }
         if bytes.is_empty() {
@@ -458,7 +581,7 @@ impl Identity {
     pub fn ek_certificate(&self) -> Result<Vec<u8>> {
         let mut ctx = context(&self.tcti)?;
         let alg = algorithm(&self.ek_kind)?;
-        let certificate = ek::retrieve_ek_pubcert(&mut ctx, alg)
+        let certificate = ek_certificate(&mut ctx, alg)
             .context("TPM has no readable EK certificate; supply --ek-cert with a manufacturer DER certificate")?;
         matching_ek(&mut ctx, alg, &certificate)?;
         Ok(certificate)
@@ -477,6 +600,7 @@ impl Identity {
         external: Option<&[u8]>,
     ) -> Result<(Self, Vec<u8>)> {
         let mut ctx = context(tcti)?;
+        signing_capabilities(&mut ctx)?;
         let alg = algorithm(kind)?;
         let certificate = if let Some(certificate) = external {
             ensure!(
@@ -485,7 +609,7 @@ impl Identity {
             );
             certificate.to_vec()
         } else {
-            ek::retrieve_ek_pubcert(&mut ctx, alg)
+            ek_certificate(&mut ctx, alg)
                 .context("TPM has no readable manufacturer EK certificate; supply --ek-cert with a manufacturer DER certificate")?
         };
         let parent = matching_ek(&mut ctx, alg, &certificate)?;
@@ -516,7 +640,7 @@ impl Identity {
         tss_esapi::handles::KeyHandle,
     )> {
         let mut ctx = context(&self.tcti)?;
-        let parent = ek::create_ek_object_2(&mut ctx, algorithm(&self.ek_kind)?, None)?;
+        let parent = endorsement_key(&mut ctx, algorithm(&self.ek_kind)?)?;
         let private = Private::try_from(hex::decode(&self.private)?)?;
         let public = Public::unmarshall(&hex::decode(&self.public)?)?;
         let session = ek_policy(&mut ctx, parent)?;

@@ -23,5 +23,6 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.98.1 --profile minimal
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libtss2-dev pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev libtss2-dev pkg-config swtpm tpm2-tools
       - run: make build
+      - run: make test-tpm

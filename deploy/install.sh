@@ -56,9 +56,9 @@ if [ -r /etc/os-release ]; then
     # os-release is a root-owned shell-compatible file on supported systems.
     . /etc/os-release
     case "${ID:-}:${VERSION_ID:-}:${ID_LIKE:-}" in
-        debian:13:*) distribution=debian ;;
+        debian:*:*|ubuntu:*:*) distribution=debian ;;
         arch:*:*|*:arch|*:arch\ *) distribution=arch ;;
-        *) case " ${ID_LIKE:-} " in *' arch '*) distribution=arch ;; esac ;;
+        *) case " ${ID_LIKE:-} " in *' arch '*) distribution=arch ;; *' debian '*) distribution=debian ;; esac ;;
     esac
 fi
 step 1 "Checking $target on ${PRETTY_NAME:-Linux}"
@@ -292,8 +292,8 @@ chmod 700 "$tmp/mysync"
 if ! reported=$("$tmp/mysync" --version 2>"$tmp/probe-error"); then
     if command -v ldd >/dev/null 2>&1 && ldd "$tmp/mysync" 2>/dev/null | grep -q 'not found'; then
         case "$distribution" in
-            debian) offer_packages 'tpm2-tools' ;;
-            arch) offer_packages 'tpm2-tss' ;;
+            debian) offer_packages 'tpm2-tools openssl' ;;
+            arch) offer_packages 'tpm2-tss openssl' ;;
             *) die 'Signed client needs native TPM/OpenSSL libraries; install them using your distribution package manager, then retry.' ;;
         esac
         reported=$("$tmp/mysync" --version) || die 'Signed client still cannot run after installing native libraries.'
@@ -314,7 +314,7 @@ ok 'Binary integrity and compatibility verified.'
 recover_ek_certificate() {
     warn 'The TPM is reachable, but its manufacturer certificate is missing or unreadable.'
     say 'The installer can check the TPM manufacturer and help retrieve its certificate.'
-    require_tools tpm2_getcap tpm2_createek tpm2_getekcertificate
+    require_tools tpm2_getcap tpm2_createek tpm2_getekcertificate tpm2_flushcontext
     tpm2_getcap -T device:/dev/tpmrm0 properties-fixed >"$tmp/tpm-properties" 2>"$tmp/tpm-tools-error" \
         || die 'Cannot read TPM properties. Check access with: tpm2_getcap -T device:/dev/tpmrm0 properties-fixed'
     manufacturer=$(python3 - "$tmp/tpm-properties" <<'PY'
@@ -366,6 +366,12 @@ with (directory / 'ek-recovery.log').open('wb') as log:
             subprocess.run([str(directory / 'mysync'), 'doctor', '--ek-cert', str(certificate)], check=True, timeout=30, stdout=log, stderr=log)
         except (OSError, subprocess.SubprocessError):
             continue
+        finally:
+            # Flush only the transient object we created. Never use -t/-s/-l,
+            # which would flush other applications' keys or sessions.
+            context = directory / f'ek-{algorithm}.ctx'
+            if context.is_file():
+                subprocess.run(['tpm2_flushcontext', *tcti, str(context)], timeout=10, stdout=log, stderr=log, check=False)
         shutil.copyfile(certificate, directory / 'recovered-ek.der')
         sys.exit(0)
 sys.exit(1)
