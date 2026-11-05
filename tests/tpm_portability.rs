@@ -1,7 +1,7 @@
 #![cfg(feature = "tpm")]
 //! Isolated simulator coverage. Every mutating command uses this test's TCTI;
 //! no command discovers or opens a host TPM.
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use mysyncfiles_client::{
     auth_protocol::{Claims, Proof},
     tpm::{self, Identity},
@@ -13,6 +13,7 @@ use openssl::{
     x509::{X509, X509NameBuilder},
 };
 use std::{
+    io::Write,
     process::{Child, Command, Stdio},
     time::Duration,
 };
@@ -51,7 +52,11 @@ impl Simulator {
             .args(["socket", "--tpm2", "--tpmstate"])
             .arg(format!("dir={}", dir.path().display()))
             .arg("--server")
-            .arg(format!("type=tcp,bindaddr=127.0.0.1,port={port}"))
+            // A child from another parallel test may inherit a TCTI socket.
+            // Close each completed connection on the simulator side as well.
+            .arg(format!(
+                "type=tcp,bindaddr=127.0.0.1,port={port},disconnect"
+            ))
             .arg("--ctrl")
             .arg(format!("type=tcp,bindaddr=127.0.0.1,port={}", port + 1))
             .args(["--flags", "not-need-init,startup-clear"])
@@ -72,10 +77,22 @@ impl Simulator {
         anyhow::bail!("swtpm did not start")
     }
     fn tool(&self, tool: &str, args: &[&str]) -> Result<()> {
-        let output = Command::new(tool)
+        self.tool_with_input(tool, args, &[])
+    }
+    fn tool_with_input(&self, tool: &str, args: &[&str], input: &[u8]) -> Result<()> {
+        let mut child = Command::new(tool)
             .args(["-T", &self.tcti])
             .args(args)
-            .output()?;
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .context("TPM tool stdin missing")?
+            .write_all(input)?;
+        let output = child.wait_with_output()?;
         ensure!(
             output.status.success(),
             "{tool}: {}",
@@ -104,6 +121,7 @@ impl Simulator {
         )
     }
     fn certificate(&self, kind: &str, custom: bool, owner_only: bool) -> Result<Vec<u8>> {
+        let nonce = b"manufacturer nonce";
         if custom {
             let alg = if kind == "rsa" {
                 AsymmetricAlgorithmSelection::Rsa(RsaKeyBits::Rsa2048)
@@ -121,19 +139,43 @@ impl Simulator {
                 &template.marshall()?,
                 "ownerread|ownerwrite|authread",
             )?;
-            self.write_nv(
-                nonce_index,
-                b"manufacturer nonce",
-                "ownerread|ownerwrite|authread",
-            )?;
+            self.write_nv(nonce_index, nonce, "ownerread|ownerwrite|authread")?;
         }
         let ctx = self.dir.path().join("ek.ctx");
         let pem = self.dir.path().join("ek.pem");
-        let mut args = vec!["-G", kind, "-c", ctx.to_str().unwrap()];
         if custom {
-            args.push("-t");
+            // tpm2_createek -t in tpm2-tools 5.4 copies the nonce pointer,
+            // not its bytes. Create this test-only EK with the explicit TCG
+            // template and padded nonce, independently of the client's reader.
+            let mut unique = vec![0; if kind == "rsa" { 256 } else { 64 }];
+            unique[..nonce.len()].copy_from_slice(nonce);
+            self.tool_with_input(
+                "tpm2_createprimary",
+                &[
+                    "-C",
+                    "e",
+                    "-g",
+                    "sha256",
+                    "-G",
+                    if kind == "rsa" {
+                        "rsa2048:aes128cfb"
+                    } else {
+                        "ecc256:aes128cfb"
+                    },
+                    "-a",
+                    "fixedtpm|fixedparent|sensitivedataorigin|adminwithpolicy|restricted|decrypt",
+                    "-L",
+                    "837197674484b3f81a90cc8d46a5d724fd52d76e06520b64f2a1da1b331469aa",
+                    "-u",
+                    "-",
+                    "-c",
+                    ctx.to_str().unwrap(),
+                ],
+                &unique,
+            )?;
+        } else {
+            self.tool("tpm2_createek", &["-G", kind, "-c", ctx.to_str().unwrap()])?;
         }
-        self.tool("tpm2_createek", &args)?;
         self.tool(
             "tpm2_readpublic",
             &[
