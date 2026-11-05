@@ -403,7 +403,9 @@ pub async fn setup_with_options(
     drop(pair_lock);
     println!("Pairing code: {}", request.code);
     drop(registration);
-    println!("Ask the administrator to run `make pair` on the server. Waiting...");
+    println!(
+        "Enter this code in `make pair` on the server. If it is already open, continue there; otherwise start it. Waiting..."
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
     let pending_path = config_path.with_extension("enrollment.json");
     let already_approved = if pending_path.exists() {
@@ -431,7 +433,9 @@ pub async fn setup_with_options(
                 "Previous pairing code expired or was cancelled. New pairing code: {}",
                 request.code
             );
-            println!("Ask the administrator to run `make pair` on the server. Waiting...");
+            println!(
+                "Enter this new code in `make pair` on the server; an already open command can be used. Waiting..."
+            );
             if !wait_for_pair_ready(&server, &request.code, deadline).await? {
                 std::fs::remove_file(&pair_path)?;
                 bail!("pairing code expired or was cancelled; rerun setup for a new code");

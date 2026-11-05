@@ -13,7 +13,7 @@ curl -fsS --proto '=https' --max-redirs 0 https://raw.githubusercontent.com/alex
 sh install.sh
 ```
 
-Le script demande l’URL HTTPS du serveur. Il télécharge une release signée depuis ce dépôt GitHub, vérifie signature et SHA-256, puis vérifie le TPM. La clé publique du serveur est reçue directement de l’administrateur. L’appairage doit être approuvé avec `make pair` côté serveur après comparaison des empreintes.
+Le script demande l’URL HTTPS du serveur. Il télécharge une release signée depuis ce dépôt GitHub, vérifie signature et SHA-256, puis vérifie le TPM. Le Server ID est la clé publique du serveur : l'administrateur l'obtient avec `make get` côté serveur et la transmet directement par un canal fiable. Le client affiche ensuite son code à saisir dans `make pair`. Si cette commande est déjà ouverte, continuer dans ce terminal et le garder ouvert jusqu'à l'approbation après comparaison des empreintes.
 
 Sur Debian 13 et Arch Linux, y compris CachyOS, l’installateur détecte les outils manquants et propose les paquets correspondants avant d’utiliser `sudo`. Si le certificat EK est absent du TPM AMD ou Intel, il propose de le récupérer auprès du fabricant après avoir expliqué l’envoi d’un identifiant du TPM. Le certificat est vérifié contre ce TPM, conservé dans `~/.config/mysync/ek.der` (ou sous `$XDG_CONFIG_HOME`) et transmis à l’appairage. Voir le [parcours de dépannage](docs/install-client.md).
 
