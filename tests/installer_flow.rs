@@ -57,10 +57,19 @@ impl InstallerFixture {
     }
 
     fn new_with_setup(doctor_ok: bool, setup_ok: bool) -> Result<Self> {
-        Self::new_with_capabilities(doctor_ok, setup_ok, true)
+        Self::new_with_browser_capabilities(doctor_ok, setup_ok, true, true)
     }
 
     fn new_with_capabilities(doctor_ok: bool, setup_ok: bool, web_status: bool) -> Result<Self> {
+        Self::new_with_browser_capabilities(doctor_ok, setup_ok, web_status, false)
+    }
+
+    fn new_with_browser_capabilities(
+        doctor_ok: bool,
+        setup_ok: bool,
+        web_status: bool,
+        web_permissions: bool,
+    ) -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().to_path_buf();
         let home = root.join("home");
@@ -87,7 +96,9 @@ echo 'TPM 2.0 is ready.'"#
                     "echo 'TPM unavailable' >&2; exit 1"
                 },
                 if setup_ok {
-                    if web_status {
+                    if web_permissions {
+                        "echo '--web-status <true|false> --web-permissions <true|false>'; exit 0"
+                    } else if web_status {
                         "echo '--web-status <true|false>'; exit 0"
                     } else {
                         "exit 0"
@@ -186,6 +197,7 @@ printf 200
             .env("NO_COLOR", "1")
             .env("TERM", "dumb")
             .env_remove("MYSYNC_WEB_STATUS")
+            .env_remove("MYSYNC_WEB_PERMISSIONS")
             .env_remove("MYSYNC_EK_CERT")
             .env("MYSYNC_TEST_ROOT", &self.root)
             .env(
@@ -846,7 +858,7 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
     let setup = fs::read_to_string(success.root.join("setup-called"))?;
     assert!(setup.contains("setup --server https://sync.example.test"));
     assert!(setup.contains("--dir"));
-    assert!(setup.contains("--web-status true"));
+    assert!(setup.contains("--web-permissions true"));
     assert!(setup.contains("--server-public-key test-origin-public-key"));
     assert!(success.root.join("systemctl-called").exists());
 
@@ -875,12 +887,132 @@ fn interactive_installer_starts_service_only_after_setup_succeeds() -> Result<()
 }
 
 #[test]
+fn installer_offers_all_browser_permissions_and_can_refuse_everything() -> Result<()> {
+    for (input, setting) in [
+        (b"\n\n".as_slice(), "true"),
+        (b"\noui\n".as_slice(), "true"),
+        (b"\nn\n".as_slice(), "false"),
+        (b"\ninvalid\nnon\n".as_slice(), "false"),
+    ] {
+        let fixture = InstallerFixture::new(true)?;
+        let output = fixture.run_interactive_with_input("0", true, input)?;
+        assert!(output.status.success(), "{output:?}");
+        let transcript = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            transcript.contains("local code execution)? [Y/n]"),
+            "{transcript}"
+        );
+        let setup = fs::read_to_string(fixture.root.join("setup-called"))?;
+        assert!(
+            setup.contains(&format!("--web-permissions {setting}")),
+            "{setup}"
+        );
+        assert!(!setup.contains("--web-status"));
+        assert!(fixture.root.join("systemctl-called").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn reinstall_keeps_saved_permissions_and_can_replace_a_custom_selection() -> Result<()> {
+    for filename in ["config.json", "config.pairing.json"] {
+        for (saved, input, setting) in [
+            (
+                serde_json::json!({"web_permissions_enabled": false, "web_status_enabled": false}),
+                b"\n\n".as_slice(),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"web_status_enabled": false, "web_files_enabled": true}),
+                b"\n\n".as_slice(),
+                None,
+            ),
+            (
+                serde_json::json!({"web_status_enabled": false, "web_files_enabled": true}),
+                b"\nn\n".as_slice(),
+                Some(false),
+            ),
+            (
+                serde_json::json!({"web_permissions_enabled": true, "web_status_enabled": false}),
+                b"\n\n".as_slice(),
+                None,
+            ),
+        ] {
+            let fixture = InstallerFixture::new(true)?;
+            let config_dir = fixture.home.join(".config/mysync");
+            safe_directory(&config_dir)?;
+            fs::write(config_dir.join(filename), serde_json::to_vec(&saved)?)?;
+            let output = fixture.run_interactive_with_input("0", false, input)?;
+            assert!(output.status.success(), "{output:?}");
+            let setup = fs::read_to_string(fixture.root.join("setup-called"))?;
+            if let Some(enabled) = setting {
+                assert!(
+                    setup.contains(&format!("--web-permissions {enabled}")),
+                    "{setup}"
+                );
+            } else {
+                assert!(!setup.contains("--web-permissions"), "{setup}");
+                assert!(!setup.contains("--web-status"), "{setup}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("Enter to keep saved permissions")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn global_permission_environment_is_validated_and_preserved_without_a_terminal() -> Result<()> {
+    for setting in ["true", "false"] {
+        let fixture = InstallerFixture::new(true)?;
+        let output = command_output(
+            fixture
+                .command("sh")?
+                .arg(&fixture.script)
+                .env("MYSYNC_WEB_PERMISSIONS", setting),
+        )?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("--web-permissions {setting}"))
+        );
+        assert!(!fixture.root.join("setup-called").exists());
+        assert!(!fixture.root.join("systemctl-called").exists());
+    }
+    for (permissions, status) in [("invalid", ""), ("true", "false")] {
+        let fixture = InstallerFixture::new(true)?;
+        let output = command_output(
+            fixture
+                .command("sh")?
+                .arg(&fixture.script)
+                .env("MYSYNC_WEB_PERMISSIONS", permissions)
+                .env("MYSYNC_WEB_STATUS", status),
+        )?;
+        assert!(!output.status.success());
+        fixture.assert_not_installed();
+    }
+    let legacy = InstallerFixture::new_with_capabilities(true, true, true)?;
+    let output = command_output(
+        legacy
+            .command("sh")?
+            .arg(&legacy.script)
+            .env("MYSYNC_WEB_PERMISSIONS", "false"),
+    )?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lacks --web-permissions"));
+    legacy.assert_not_installed();
+    Ok(())
+}
+
+#[test]
 fn installer_offers_web_status_and_preserves_saved_opt_out() -> Result<()> {
     for (input, setting) in [
         (b"\nn\n".as_slice(), None),
         (b"\n".as_slice(), Some("false")),
     ] {
-        let fixture = InstallerFixture::new(true)?;
+        let fixture = InstallerFixture::new_with_capabilities(true, true, true)?;
         let output = fixture.run_interactive_with_setting("0", true, input, setting)?;
         assert!(
             output.status.success(),
@@ -894,7 +1026,7 @@ fn installer_offers_web_status_and_preserves_saved_opt_out() -> Result<()> {
     }
     // Both an active profile and a pairing awaiting approval keep their choice.
     for filename in ["config.json", "config.pairing.json"] {
-        let fixture = InstallerFixture::new(true)?;
+        let fixture = InstallerFixture::new_with_capabilities(true, true, true)?;
         let config_dir = fixture.home.join(".config/mysync");
         safe_directory(&config_dir)?;
         fs::write(config_dir.join(filename), b"{\"web_status_enabled\":false}")?;
@@ -914,7 +1046,7 @@ fn installer_offers_web_status_and_preserves_saved_opt_out() -> Result<()> {
 
 #[test]
 fn installer_checks_web_status_input_and_legacy_capability() -> Result<()> {
-    let fixture = InstallerFixture::new(true)?;
+    let fixture = InstallerFixture::new_with_capabilities(true, true, true)?;
     let output = command_output(
         fixture
             .command("sh")?
@@ -1001,6 +1133,48 @@ PY
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    Ok(())
+}
+
+#[test]
+fn source_installer_applies_all_permissions_before_starting_service() -> Result<()> {
+    let fixture = InstallerFixture::new(true)?;
+    executable(&fixture.mocks.join("id"), "#!/bin/sh\necho test-user\n")?;
+    executable(&fixture.mocks.join("loginctl"), "#!/bin/sh\necho yes\n")?;
+    let config = fixture.home.join(".config/mysync/config.json");
+    safe_directory(config.parent().unwrap())?;
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "server": "https://sync.example.test", "root": fixture.home
+        }))?,
+    )?;
+    executable(
+        &fixture.mocks.join("systemctl"),
+        r##"#!/bin/sh
+python3 - "$XDG_CONFIG_HOME/mysync/config.json" "$MYSYNC_TEST_EXPECT_PERMISSIONS" <<'PY'
+import json, sys
+with open(sys.argv[1]) as source:
+    profile = json.load(source)
+expected = sys.argv[2] == 'true'
+assert profile['web_status_enabled'] == expected
+for key in ('web_files_enabled', 'web_uploads_enabled', 'web_management_enabled', 'web_edit_enabled', 'web_run_enabled'):
+    assert profile.get(key, False) == expected, key
+PY
+"##,
+    )?;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy/install-client.sh");
+    for setting in ["true", "false"] {
+        let output = command_output(
+            fixture
+                .command("bash")?
+                .arg(&script)
+                .arg(env!("CARGO_BIN_EXE_mysync"))
+                .env("MYSYNC_WEB_PERMISSIONS", setting)
+                .env("MYSYNC_TEST_EXPECT_PERMISSIONS", setting),
+        )?;
+        assert!(output.status.success(), "{output:?}");
     }
     Ok(())
 }

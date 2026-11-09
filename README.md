@@ -15,13 +15,15 @@ sh install.sh
 
 Le script demande l’URL HTTPS du serveur. Il télécharge une release signée depuis ce dépôt GitHub, vérifie signature et SHA-256, puis vérifie le TPM. Le Server ID est la clé publique du serveur : l'administrateur l'obtient avec `make get` côté serveur et la transmet directement par un canal fiable. Le client affiche ensuite son code à saisir dans `make pair`. Si cette commande est déjà ouverte, continuer dans ce terminal et le garder ouvert jusqu'à l'approbation après comparaison des empreintes.
 
+Depuis **0.4.2**, une seule question propose **toutes les autorisations web** avec oui par défaut : présence, lecture, envoi, renommage/suppression, édition et exécution locale du code Python/C. Répondre non les désactive toutes. Une réinstallation ou une reprise propose de conserver les choix enregistrés, y compris une sélection personnalisée. `MYSYNC_WEB_PERMISSIONS=true` ou `false` fixe le choix sans question. L’option manuelle équivalente est `mysync setup --web-permissions true ...` ou `false`. Une ancienne release conserve son parcours limité à la présence web et signale la nécessité d’une nouvelle release pour le choix global.
+
 Sur Debian 13 et Arch Linux, y compris CachyOS, l’installateur détecte les outils manquants et propose les paquets correspondants avant d’utiliser `sudo`. Si le certificat EK est absent du TPM AMD ou Intel, il propose de le récupérer auprès du fabricant après avoir expliqué l’envoi d’un identifiant du TPM. Le certificat est vérifié contre ce TPM, conservé dans `~/.config/mysync/ek.der` (ou sous `$XDG_CONFIG_HOME`) et transmis à l’appairage. Voir le [parcours de dépannage](docs/install-client.md).
 
 Depuis 0.4.1, le client complète aussi la chaîne AMD manquante auprès de `https://ftpm.amd.com/pki/aia/`, y compris lorsque le TPM ne fournit aucun intermédiaire. Les adresses HTTP annoncées dans ces certificats sont converties en HTTPS avant la requête. Le serveur conserve la validation contre ses racines constructeur configurées.
 
-Prérequis : Linux x86-64 ou AArch64, TPM 2.0 avec certificat EK constructeur vérifiable. Debian 13 et Arch Linux sont les distributions de validation. `MYSYNC_SERVER_URL`, `MYSYNC_PROFILE`, `MYSYNC_WEB_STATUS`, `MYSYNC_EK_CERT` et `MYSYNC_EK_CHAIN` configurent l’installateur. Sans terminal, `MYSYNC_SERVER_URL` est requis et aucun service n’est démarré automatiquement.
+Prérequis : Linux x86-64 ou AArch64, TPM 2.0 avec certificat EK constructeur vérifiable. Debian 13 et Arch Linux sont les distributions de validation. `MYSYNC_SERVER_URL`, `MYSYNC_PROFILE`, `MYSYNC_WEB_PERMISSIONS`, `MYSYNC_EK_CERT` et `MYSYNC_EK_CHAIN` configurent l’installateur. `MYSYNC_WEB_STATUS` reste disponible pour changer uniquement la présence ; ne pas la combiner avec `MYSYNC_WEB_PERMISSIONS`. Sans terminal, `MYSYNC_SERVER_URL` est requis et aucun service n’est démarré automatiquement.
 
-Une release signée 0.4 doit être publiée séparément pour installer cette version. Tant qu’aucune release marquée « latest » ne contient le manifeste de votre architecture et son binaire, le téléchargement renvoie HTTP 404 : l’administrateur du dépôt doit suivre la [procédure de publication](docs/releases.md). Le protocole exige également un serveur 0.4 ; les profils et appairages TPM existants peuvent être conservés.
+L’installateur utilise la dernière release signée publiée dans ce dépôt. Tant qu’aucune release marquée « latest » ne contient le manifeste de votre architecture et son binaire, le téléchargement renvoie HTTP 404 : l’administrateur du dépôt doit suivre la [procédure de publication](docs/releases.md). Le protocole exige également un serveur 0.4 ; les profils et appairages TPM existants peuvent être conservés.
 
 ## Plusieurs serveurs
 
@@ -35,7 +37,9 @@ mysync daemon --all
 
 Chaque dossier doit être distinct et non imbriqué. Les profils nommés sont enregistrés dans `$XDG_CONFIG_HOME/mysync/profiles/NOM.json` (ou `~/.config/mysync/profiles`). Le profil `default` désigne l’ancien `mysync/config.json`. Les états, journaux et appairages en attente restent à côté du profil, hors du miroir. `--config` permet un chemin explicite ; le service commun charge uniquement les profils enregistrés.
 
-Le service utilisateur lance `mysync daemon --all`. Redémarrer le service après l’ajout d’un profil ou un changement d’autorisation. Un pont loopback unique sélectionne la connexion par origine HTTPS exacte ; les autorisations `web-files` et `web-status` s’appliquent au profil sélectionné. Deux profils web sur la même origine sont refusés.
+Le service utilisateur lance `mysync daemon --all`. Après l’ajout d’un profil, une mise à jour ou un changement d’autorisation, lancer `mysync restart` : cette commande recharge les unités systemd utilisateur puis redémarre `mysync.service` pour tous les profils. Sur un ancien client, utiliser `systemctl --user daemon-reload && systemctl --user restart mysync.service`. Pour un daemon lancé dans un terminal, l’arrêter avec Ctrl+C puis relancer sa commande `mysync daemon`. Un pont loopback unique sélectionne la connexion par origine HTTPS exacte ; les autorisations `web-files` et `web-status` s’appliquent au profil sélectionné. Deux profils web sur la même origine sont refusés.
+
+Pour tout autoriser ou tout refuser ensuite sur un profil : `mysync web-permissions enable` ou `mysync web-permissions disable`, puis `mysync restart`. Les réglages individuels restent disponibles via `web-status` et `web-files`. Si le profil est occupé, attendre la fin de la synchronisation ou lancer `systemctl --user stop mysync.service` avant de modifier les réglages.
 
 ## Sécurité des sessions
 

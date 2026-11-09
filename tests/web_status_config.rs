@@ -229,3 +229,61 @@ fn directory_management_is_disabled_by_default_and_requires_its_own_local_consen
     assert!(!client::load_config(&config)?.web_management_enabled);
     Ok(())
 }
+
+#[test]
+fn global_browser_consent_is_atomic_local_and_keeps_other_profile_data() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let config = temp.path().join("client.json");
+    let original = serde_json::json!({
+        "server": "https://sync.example.test", "root": temp.path(),
+        "server_public_key": "keep-origin-key", "auto_update": false,
+        "update_public_key": "keep-release-key"
+    });
+    fs::write(&config, serde_json::to_vec(&original)?)?;
+    fs::write(config.with_extension("state.json"), b"keep-state")?;
+    assert_eq!(
+        cli(&config, &["web-permissions", "status"])?.stdout,
+        b"web_permissions_enabled=custom\n"
+    );
+    for (action, enabled) in [("enable", true), ("disable", false)] {
+        let output = cli(&config, &["web-permissions", action])?;
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("mysync restart"));
+        let saved = client::load_config(&config)?;
+        assert_eq!(saved.web_status_enabled, enabled);
+        assert_eq!(saved.web_files_enabled, enabled);
+        assert_eq!(saved.web_uploads_enabled, enabled);
+        assert_eq!(saved.web_management_enabled, enabled);
+        assert_eq!(saved.web_edit_enabled, enabled);
+        assert_eq!(saved.web_run_enabled, enabled);
+        assert_eq!(
+            cli(&config, &["web-permissions"])?.stdout,
+            format!("web_permissions_enabled={enabled}\n").as_bytes()
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&config)?)?;
+        for key in [
+            "web_status_enabled",
+            "web_files_enabled",
+            "web_uploads_enabled",
+            "web_management_enabled",
+            "web_edit_enabled",
+            "web_run_enabled",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(value, original);
+        assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::read(config.with_extension("state.json"))?,
+            b"keep-state"
+        );
+    }
+    let bytes = fs::read(&config)?;
+    let lock = fs::File::create(config.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    let output = cli(&config, &["web-permissions", "enable"])?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("profile is busy"));
+    assert_eq!(fs::read(&config)?, bytes);
+    Ok(())
+}

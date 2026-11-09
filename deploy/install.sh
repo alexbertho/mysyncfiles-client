@@ -28,6 +28,12 @@ case "$web_status" in
     ''|true|false) ;;
     *) die 'MYSYNC_WEB_STATUS must be true or false.' ;;
 esac
+web_permissions=${MYSYNC_WEB_PERMISSIONS:-}
+case "$web_permissions" in
+    ''|true|false) ;;
+    *) die 'MYSYNC_WEB_PERMISSIONS must be true or false.' ;;
+esac
+[ -z "$web_status" ] || [ -z "$web_permissions" ] || die 'Choose either MYSYNC_WEB_PERMISSIONS or MYSYNC_WEB_STATUS.'
 
 say '  /\/\  MySyncFiles'
 say ' /_/\_\ Client setup'
@@ -305,6 +311,12 @@ fi
 setup_help=$("$tmp/mysync" setup --help 2>/dev/null) || die 'The signed client release lacks the setup command; ask the administrator to publish a newer signed client.'
 supports_web_status=0
 case "$setup_help" in *--web-status*) supports_web_status=1 ;; esac
+supports_web_permissions=0
+case "$setup_help" in *--web-permissions*) supports_web_permissions=1 ;; esac
+if [ "$supports_web_permissions" = 0 ]; then
+    [ -z "$web_permissions" ] || die 'The signed client lacks --web-permissions; ask the administrator to publish a signed client with this option.'
+    warn 'This signed client cannot configure all browser permissions during setup; a newer signed client is required for that choice.'
+fi
 if [ "$supports_web_status" = 0 ]; then
     [ -z "$web_status" ] || die 'The signed client lacks --web-status; ask the administrator to publish MySyncFiles 0.3.8 or newer.'
     warn 'This signed client does not offer the browser status setting; it requires MySyncFiles 0.3.8 or newer.'
@@ -576,7 +588,7 @@ if [ "$legacy_profile" = 1 ]; then
         [ ! -e "$file" ] && [ ! -L "$file" ] || die "A TPM pairing is already pending; review $file before replacing the legacy profile."
     done
     if systemctl --user is-active --quiet mysync.service; then
-        die 'Stop the running mysync user service before archiving its legacy profile.'
+        die 'Stop the running mysync user service before archiving its legacy profile: systemctl --user stop mysync.service'
     fi
     [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || die 'A legacy token profile was found. Rerun this installer in a terminal to archive it before TPM pairing.'
     warn 'A legacy token profile cannot be used for TPM pairing.'
@@ -599,14 +611,64 @@ if [ "$legacy_profile" = 1 ]; then
     say 'Choose the existing sync folder at the next prompt.'
 fi
 
+prompt_web_permissions=0
+if [ "$supports_web_permissions" = 1 ] && [ -z "$web_status" ] && [ -z "$web_permissions" ]; then
+    # New installations offer all permissions. Reinstallations keep each saved
+    # choice, including a custom selection and an interrupted pairing.
+    web_permissions=$(python3 - "$config_file" "${config_file%.json}.pairing.json" <<'PY'
+import json, pathlib, sys
+
+choice = 'true'
+for filename in sys.argv[1:]:
+    path = pathlib.Path(filename)
+    if not path.exists():
+        continue
+    profile = json.loads(path.read_bytes())
+    enabled = profile.get('web_permissions_enabled')
+    if enabled is not None and type(enabled) is not bool:
+        raise SystemExit('Saved web_permissions_enabled must be a boolean.')
+    permissions = [profile.get('web_status_enabled', True if enabled is None else enabled)]
+    permissions += [profile.get(key, False if enabled is None else enabled) for key in (
+        'web_files_enabled', 'web_uploads_enabled', 'web_management_enabled',
+        'web_edit_enabled', 'web_run_enabled')]
+    if any(type(value) is not bool for value in permissions):
+        raise SystemExit('Saved browser permissions must be booleans.')
+    choice = 'true' if all(permissions) else 'false' if not any(permissions) else 'custom'
+    break
+print(choice)
+PY
+) || die 'Cannot read the saved browser permissions.'
+    prompt_web_permissions=1
+fi
+
 if [ -t 1 ] && [ -r /dev/tty ]; then
     step 6 'Pairing this client with the server'
     printf 'Folder to synchronize [%s/Sync/%s]: ' "$HOME" "$profile" >/dev/tty
     mirror_dir=
     IFS= read -r mirror_dir </dev/tty || die 'Cannot read the folder from the terminal.'
     [ -n "$mirror_dir" ] || mirror_dir="$HOME/Sync/$profile"
+    if [ "$prompt_web_permissions" = 1 ]; then
+        case "$web_permissions" in
+            true) prompt='Y/n' ;;
+            false) prompt='y/N' ;;
+            custom) prompt='y/n, Enter to keep saved permissions' ;;
+        esac
+        while :; do
+            printf 'Allow all browser permissions (status, files, uploads, rename/delete, editing and local code execution)? [%s] ' "$prompt" >/dev/tty
+            answer=
+            IFS= read -r answer </dev/tty || die 'Cannot read the browser permissions choice from the terminal.'
+            case "$answer" in
+                '') break ;;
+                y|Y|yes|YES|o|O|oui|OUI) web_permissions=true; break ;;
+                n|N|no|NO|non|NON) web_permissions=false; break ;;
+                *) say 'Please answer yes or no.' ;;
+            esac
+        done
+    fi
     set -- setup --server "$SERVER_URL" --dir "$mirror_dir" --config "$config_file"
-    if [ "$supports_web_status" = 1 ]; then
+    if [ -n "$web_permissions" ]; then
+        [ "$web_permissions" = custom ] || set -- "$@" --web-permissions "$web_permissions"
+    elif [ "$supports_web_status" = 1 ]; then
         if [ -z "$web_status" ]; then
             # Preserve a saved choice, including a setup interrupted before approval.
             web_status=$(python3 - "$config_file" "${config_file%.json}.pairing.json" <<'PY'
@@ -647,16 +709,20 @@ PY
     fi
     "$destination" "$@" </dev/tty || die 'Pairing or first synchronization is incomplete. Rerun this installer or mysync setup to resume; the service remains stopped.'
     if [ "$service_ready" = 1 ]; then
-        systemctl --user daemon-reload || die 'Synchronization succeeded, but the user service manager could not reload.'
+        systemctl --user daemon-reload || die 'Synchronization succeeded, but the user service manager could not reload. Retry: systemctl --user daemon-reload && systemctl --user restart mysync.service'
         systemctl --user enable mysync.service || die 'Synchronization succeeded, but the user service could not be enabled.'
-        systemctl --user restart mysync.service || die 'Synchronization succeeded, but the user service could not start. Check systemctl --user status mysync.service.'
+        systemctl --user restart mysync.service || die 'Synchronization succeeded, but the user service could not start. Retry: systemctl --user restart mysync.service; inspect: systemctl --user status mysync.service'
         ok 'Client paired, files checked and user service started.'
     else
         warn 'Pairing succeeded, but the existing service file differs; review it before starting the service.'
+        say 'After reviewing the unit: systemctl --user daemon-reload && systemctl --user restart mysync.service'
     fi
     say 'For startup without login: sudo loginctl enable-linger "$(id -un)"'
 else
     set -- "$destination" setup --config "$config_file" --server "$SERVER_URL" --dir "$HOME/Sync"
+    if [ -n "$web_permissions" ] && [ "$web_permissions" != custom ]; then
+        set -- "$@" --web-permissions "$web_permissions"
+    fi
     [ -z "$web_status" ] || set -- "$@" --web-status "$web_status"
     [ -z "${MYSYNC_EK_CERT:-}" ] || set -- "$@" --ek-cert "$MYSYNC_EK_CERT"
     [ -z "${MYSYNC_EK_CHAIN:-}" ] || set -- "$@" --ek-chain "$MYSYNC_EK_CHAIN"
