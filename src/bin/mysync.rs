@@ -179,7 +179,13 @@ fn server_key(config: &Path, supplied: Option<String>) -> Result<String> {
     if !std::io::stdin().is_terminal() {
         bail!("--server-public-key is required; obtain it directly from the administrator");
     }
-    print!("Server public key provided directly by the administrator: ");
+    println!(
+        "On the server, run `make get` and copy the Server ID (public key) through a trusted channel."
+    );
+    println!(
+        "An already open `make pair` also displays this key and can stay open for the next step."
+    );
+    print!("Server ID (public key) provided directly by the administrator: ");
     std::io::stdout().flush()?;
     let mut key = String::new();
     std::io::stdin().read_line(&mut key)?;

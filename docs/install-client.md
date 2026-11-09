@@ -24,6 +24,12 @@ MYSYNC_EK_CERT="$HOME/.config/mysync/ek.der" sh install.sh
 
 Pour les autres fabricants, le script indique comment identifier le TPM et fournir ce certificat. Si AMD ou Intel ne renvoie aucun certificat correspondant, vérifier la connectivité vers le service indiqué et les informations de prise en charge du firmware auprès du constructeur du PC. Ne pas publier le certificat ou l’identifiant EK dans un ticket public.
 
+## Server ID et reprise d'appairage
+
+Le Server ID demandé par le client est la clé publique du serveur. Sur le serveur mis à jour, `make get` affiche cette clé, les appareils et le stockage sans créer d'invitation. La transmettre au client directement par un canal fiable. Si `make pair` est déjà ouvert pour lire cette clé, le conserver : le code affiché ensuite par le client se saisit dans ce même terminal, puis l'administrateur attend la preuve TPM et confirme l'empreinte.
+
+Une reprise utilise le même nom et le même code. Si un nouveau code est utilisé pour un nom ayant une invitation en attente, le serveur mis à jour propose de remplacer cette invitation après confirmation ; l'ancien code est alors annulé. Un appareil déjà approuvé reste protégé : reprendre son profil existant ou choisir un autre nom pour un nouveau client.
+
 ## Refus HTTP 401 pendant l’appairage
 
 Le nom demandé par `make pair` est un libellé choisi par l’administrateur pour reconnaître le PC, par exemple `pc-bureau`. Conserver le même nom et le même code pour reprendre une demande encore valide ; après expiration, relancer l’installateur et utiliser le code qu’il affiche.
