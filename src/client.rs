@@ -61,6 +61,33 @@ pub struct ClientConfig {
     pub update_public_key: String,
 }
 
+impl ClientConfig {
+    pub fn set_web_permissions(&mut self, enabled: bool) {
+        self.web_status_enabled = enabled;
+        self.web_files_enabled = enabled;
+        self.web_uploads_enabled = enabled;
+        self.web_management_enabled = enabled;
+        self.web_edit_enabled = enabled;
+        self.web_run_enabled = enabled;
+    }
+
+    /// None denotes a custom selection of browser permissions.
+    pub fn web_permissions_enabled(&self) -> Option<bool> {
+        let permissions = [
+            self.web_status_enabled,
+            self.web_files_enabled,
+            self.web_uploads_enabled,
+            self.web_management_enabled,
+            self.web_edit_enabled,
+            self.web_run_enabled,
+        ];
+        permissions
+            .iter()
+            .all(|value| *value == permissions[0])
+            .then_some(permissions[0])
+    }
+}
+
 fn default_auto_update() -> bool {
     true
 }
@@ -203,16 +230,26 @@ pub async fn trust_server(config_path: &Path, public_key: &str) -> Result<()> {
 pub fn set_web_status(config_path: &Path, enabled: bool) -> Result<()> {
     let lock = open_profile_lock(config_path)?;
     FileExt::try_lock_exclusive(&lock)
-        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
     let mut config = load_config(config_path)?;
     config.web_status_enabled = enabled;
+    private_write_json(config_path, &config)
+}
+
+/// Save one explicit consent decision for all browser capabilities atomically.
+pub fn set_web_permissions(config_path: &Path, enabled: bool) -> Result<()> {
+    let lock = open_profile_lock(config_path)?;
+    FileExt::try_lock_exclusive(&lock)
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
+    let mut config = load_config(config_path)?;
+    config.set_web_permissions(enabled);
     private_write_json(config_path, &config)
 }
 
 pub fn set_web_files(config_path: &Path, enabled: bool) -> Result<()> {
     let lock = open_profile_lock(config_path)?;
     FileExt::try_lock_exclusive(&lock)
-        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
     let mut config = load_config(config_path)?;
     config.web_files_enabled = enabled;
     private_write_json(config_path, &config)
@@ -221,7 +258,7 @@ pub fn set_web_files(config_path: &Path, enabled: bool) -> Result<()> {
 pub fn set_web_uploads(config_path: &Path, enabled: bool) -> Result<()> {
     let lock = open_profile_lock(config_path)?;
     FileExt::try_lock_exclusive(&lock)
-        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
     let mut config = load_config(config_path)?;
     config.web_uploads_enabled = enabled;
     private_write_json(config_path, &config)
@@ -230,7 +267,7 @@ pub fn set_web_uploads(config_path: &Path, enabled: bool) -> Result<()> {
 pub fn set_web_management(config_path: &Path, enabled: bool) -> Result<()> {
     let lock = open_profile_lock(config_path)?;
     FileExt::try_lock_exclusive(&lock)
-        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
     let mut config = load_config(config_path)?;
     config.web_management_enabled = enabled;
     private_write_json(config_path, &config)
@@ -239,7 +276,7 @@ pub fn set_web_management(config_path: &Path, enabled: bool) -> Result<()> {
 pub fn set_web_editor(config_path: &Path, execution: bool, enabled: bool) -> Result<()> {
     let lock = open_profile_lock(config_path)?;
     FileExt::try_lock_exclusive(&lock)
-        .context("client profile is busy; stop the daemon or retry after synchronization")?;
+        .context("client profile is busy; run `systemctl --user stop mysync.service` or retry after synchronization, then `mysync restart`")?;
     let mut config = load_config(config_path)?;
     if execution {
         config.web_run_enabled = enabled;

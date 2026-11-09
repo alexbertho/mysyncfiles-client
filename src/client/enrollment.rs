@@ -181,6 +181,8 @@ struct PairingRequest {
     code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_status_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_permissions_enabled: Option<bool>,
 }
 
 #[derive(Default)]
@@ -188,6 +190,8 @@ pub struct SetupOptions {
     pub ek_cert: Option<PathBuf>,
     pub ek_chain: Option<PathBuf>,
     pub web_status_enabled: Option<bool>,
+    /// One explicit decision for presence, files, uploads, management, edit and run.
+    pub web_permissions_enabled: Option<bool>,
     /// Override the TPM transport for tests; manufacturer trust is unchanged.
     pub tcti: Option<String>,
 }
@@ -328,8 +332,13 @@ pub async fn setup_with_options(
         ek_cert,
         ek_chain,
         web_status_enabled,
+        web_permissions_enabled,
         tcti,
     } = options;
+    ensure!(
+        web_status_enabled.is_none() || web_permissions_enabled.is_none(),
+        "choose either --web-permissions or --web-status"
+    );
     let tcti = tcti.unwrap_or_else(crate::tpm::default_tcti);
     validate_server_url(&server)?;
     let server_public_key =
@@ -354,7 +363,9 @@ pub async fn setup_with_options(
         {
             bail!("existing client profile has a different server, key or folder");
         }
-        if let Some(enabled) = web_status_enabled {
+        if let Some(enabled) = web_permissions_enabled {
+            super::set_web_permissions(config_path, enabled)?;
+        } else if let Some(enabled) = web_status_enabled {
             super::set_web_status(config_path, enabled)?;
         }
         let report = sync(config_path).await?;
@@ -388,13 +399,20 @@ pub async fn setup_with_options(
             root: root.clone(),
             code: crate::auth_protocol::pairing_code()?,
             web_status_enabled: Some(
-                web_status_enabled.unwrap_or_else(super::default_web_status_enabled),
+                web_permissions_enabled
+                    .or(web_status_enabled)
+                    .unwrap_or_else(super::default_web_status_enabled),
             ),
+            web_permissions_enabled,
         };
         private_write_json(&pair_path, &request)?;
         request
     };
-    if let Some(enabled) = web_status_enabled
+    if let Some(enabled) = web_permissions_enabled {
+        request.web_permissions_enabled = Some(enabled);
+        request.web_status_enabled = Some(enabled);
+        private_write_json(&pair_path, &request)?;
+    } else if let Some(enabled) = web_status_enabled
         && request.web_status_enabled != Some(enabled)
     {
         request.web_status_enabled = Some(enabled);
@@ -466,10 +484,10 @@ pub async fn setup_with_options(
     Ok(SetupOutcome { report, conflicts })
 }
 
-fn pairing_web_status(config_path: &Path, config: &ClientConfig) -> Result<Option<bool>> {
+fn apply_pairing_web_preferences(config_path: &Path, config: &mut ClientConfig) -> Result<bool> {
     let bytes = match std::fs::read(config_path.with_extension("pairing.json")) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
     let request: PairingRequest = serde_json::from_slice(&bytes)?;
@@ -479,7 +497,16 @@ fn pairing_web_status(config_path: &Path, config: &ClientConfig) -> Result<Optio
     {
         bail!("pairing preferences belong to a different client profile");
     }
-    Ok(request.web_status_enabled)
+    let mut changed = false;
+    if let Some(enabled) = request.web_permissions_enabled {
+        changed = config.web_permissions_enabled() != Some(enabled);
+        config.set_web_permissions(enabled);
+    }
+    if let Some(enabled) = request.web_status_enabled {
+        changed |= config.web_status_enabled != enabled;
+        config.web_status_enabled = enabled;
+    }
+    Ok(changed)
 }
 
 pub async fn enroll(
@@ -580,9 +607,7 @@ pub async fn enroll_with_tcti(
             web_run_enabled: false,
             update_public_key: default_update_public_key(),
         };
-        if let Some(enabled) = pairing_web_status(config_path, &config)? {
-            config.web_status_enabled = enabled;
-        }
+        apply_pairing_web_preferences(config_path, &mut config)?;
         Api::new(&config)?;
         let pending = PendingEnrollment {
             config,
@@ -591,10 +616,7 @@ pub async fn enroll_with_tcti(
         private_write_json(&pending_path, &pending)?;
         pending
     };
-    if let Some(enabled) = pairing_web_status(config_path, &pending.config)?
-        && pending.config.web_status_enabled != enabled
-    {
-        pending.config.web_status_enabled = enabled;
+    if apply_pairing_web_preferences(config_path, &mut pending.config)? {
         private_write_json(&pending_path, &pending)?;
     }
     drop(registration);
@@ -670,9 +692,7 @@ pub async fn activate_enrollment(config_path: &Path) -> Result<SyncReport> {
     let pending_path = config_path.with_extension("enrollment.json");
     let mut pending: PendingEnrollment =
         serde_json::from_slice(&std::fs::read(&pending_path).context("no pending enrollment")?)?;
-    if let Some(enabled) = pairing_web_status(config_path, &pending.config)? {
-        pending.config.web_status_enabled = enabled;
-    }
+    apply_pairing_web_preferences(config_path, &mut pending.config)?;
     Api::new(&pending.config)?.authenticate().await?;
     private_write_json(config_path, &pending.config)?;
     std::fs::remove_file(pending_path)?;
@@ -683,6 +703,46 @@ pub async fn activate_enrollment(config_path: &Path) -> Result<SyncReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_keeps_global_consent_and_legacy_status_choices_on_resume() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("config.json");
+        let mut config: ClientConfig = serde_json::from_value(serde_json::json!({
+            "server": "https://sync.example.test", "server_public_key": "origin-key",
+            "root": temp.path()
+        }))?;
+        let mut request = serde_json::json!({
+            "server": config.server, "server_public_key": config.server_public_key,
+            "root": config.root, "code": "saved-pairing-code"
+        });
+        for enabled in [true, false] {
+            request["web_permissions_enabled"] = enabled.into();
+            request["web_status_enabled"] = enabled.into();
+            private_write_json(&path.with_extension("pairing.json"), &request)?;
+            apply_pairing_web_preferences(&path, &mut config)?;
+            assert_eq!(config.web_permissions_enabled(), Some(enabled));
+            // Saved profiles and pending enrollments use the same config format.
+            config = serde_json::from_slice(&serde_json::to_vec(&config)?)?;
+            assert!(!apply_pairing_web_preferences(&path, &mut config)?);
+        }
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("web_permissions_enabled");
+        request["web_status_enabled"] = true.into();
+        private_write_json(&path.with_extension("pairing.json"), &request)?;
+        apply_pairing_web_preferences(&path, &mut config)?;
+        assert!(config.web_status_enabled);
+        assert!(!config.web_files_enabled && !config.web_run_enabled);
+        request["server"] = "https://other.example.test".into();
+        private_write_json(&path.with_extension("pairing.json"), &request)?;
+        let previous = serde_json::to_vec(&config)?;
+        assert!(apply_pairing_web_preferences(&path, &mut config).is_err());
+        assert_eq!(serde_json::to_vec(&config)?, previous);
+        Ok(())
+    }
+
     #[test]
     fn intel_issuer_aia_accepts_only_the_manufacturer_certificate_repository() -> Result<()> {
         // Public CA certificate from Intel's OnDieCA certificate repository.

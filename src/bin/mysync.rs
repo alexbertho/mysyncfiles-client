@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use mysyncfiles_client::client::{self, Api, SyncReport};
 
@@ -45,6 +45,9 @@ enum Command {
         /// Enable browser status (new profiles default to true; existing choices are kept)
         #[arg(long, action = clap::ArgAction::Set)]
         web_status: Option<bool>,
+        /// Allow or refuse all browser permissions, including local code execution
+        #[arg(long, action = clap::ArgAction::Set, conflicts_with = "web_status")]
+        web_permissions: Option<bool>,
     },
     /// Check TPM 2.0 access and an EK certificate without enrolling
     Doctor {
@@ -88,7 +91,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<WebStatusAction>,
     },
-    /// Configure browser file access (disabled by default); restart the daemon
+    /// Allow or refuse all browser permissions for this profile; then run mysync restart
+    WebPermissions {
+        #[command(subcommand)]
+        action: Option<WebStatusAction>,
+    },
+    /// Configure individual browser file permissions; then run mysync restart
     WebFiles {
         #[command(subcommand)]
         action: Option<WebFilesAction>,
@@ -101,6 +109,8 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Reload systemd user units and restart mysync.service for all profiles
+    Restart,
     /// List local server profiles without connecting
     Profiles,
     /// Show local and server file counts
@@ -192,9 +202,43 @@ fn server_key(config: &Path, supplied: Option<String>) -> Result<String> {
     Ok(key.trim().to_owned())
 }
 
+fn restart_hint() {
+    println!("To apply to the installed user service, run: mysync restart");
+    println!(
+        "For a daemon started in a terminal, stop it with Ctrl+C and rerun its mysync daemon command."
+    );
+}
+
+async fn restart_service() -> Result<()> {
+    for action in ["daemon-reload", "restart"] {
+        let mut command = tokio::process::Command::new("systemctl");
+        command.args(["--user", action]);
+        if action == "restart" {
+            command.arg("mysync.service");
+        }
+        let status = command
+            .status()
+            .await
+            .with_context(|| format!("cannot run systemctl --user {action}; for a terminal daemon, stop it with Ctrl+C and rerun its mysync daemon command"))?;
+        ensure!(
+            status.success(),
+            "systemctl --user {action} failed ({status}); inspect `systemctl --user status mysync.service`; for a terminal daemon, stop it with Ctrl+C and rerun its mysync daemon command"
+        );
+    }
+    println!("Restarted mysync.service for all registered profiles.");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Restart) {
+        ensure!(
+            cli.profile.is_none() && cli.config.is_none(),
+            "mysync restart restarts the user service for all profiles; omit --profile and --config"
+        );
+        return restart_service().await;
+    }
     if matches!(cli.command, Command::Profiles) {
         for (name, path) in client::profiles::list()? {
             let config = client::load_config(&path)?;
@@ -240,9 +284,8 @@ async fn main() -> Result<()> {
                 "installed client: {installed_version}; latest signed release: {published_version}; no update installed"
             ),
             mysyncfiles_client::update::UpdateOutcome::Installed(version) => {
-                println!(
-                    "installed {version}; restart the running daemon or mysync.service to use this version"
-                )
+                println!("installed {version}; restart the running daemon to use this version");
+                restart_hint();
             }
         }
         return Ok(());
@@ -257,6 +300,7 @@ async fn main() -> Result<()> {
             ek_chain,
             ek_cert,
             web_status,
+            web_permissions,
         } => {
             let key = server_key(&config_path, server_public_key)?;
             let outcome = client::setup_with_options(
@@ -268,6 +312,7 @@ async fn main() -> Result<()> {
                     ek_cert,
                     ek_chain,
                     web_status_enabled: web_status,
+                    web_permissions_enabled: web_permissions,
                     tcti,
                 },
             )
@@ -280,6 +325,7 @@ async fn main() -> Result<()> {
                 );
             }
             println!("Initial synchronization verified; the service can now be started.");
+            restart_hint();
         }
         Command::Doctor { .. } => unreachable!(),
         Command::Enroll {
@@ -317,6 +363,7 @@ async fn main() -> Result<()> {
         Command::TrustServer { public_key } => {
             client::trust_server(&config_path, &public_key).await?;
             println!("Server public key pinned in the client profile.");
+            restart_hint();
         }
         Command::WebStatus { action } => {
             let enabled = match action {
@@ -326,7 +373,8 @@ async fn main() -> Result<()> {
             };
             if let Some(enabled) = enabled {
                 client::set_web_status(&config_path, enabled)?;
-                println!("web_status_enabled={enabled}; restart the running daemon to apply");
+                println!("web_status_enabled={enabled}");
+                restart_hint();
             } else {
                 println!(
                     "web_status_enabled={}",
@@ -334,27 +382,48 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::WebPermissions { action } => match action {
+            Some(WebStatusAction::Enable | WebStatusAction::Disable) => {
+                let enabled = matches!(action, Some(WebStatusAction::Enable));
+                client::set_web_permissions(&config_path, enabled)?;
+                println!("web_permissions_enabled={enabled}");
+                println!("Existing browser file sessions expire within 30 minutes.");
+                restart_hint();
+            }
+            Some(WebStatusAction::Status) | None => {
+                let config = client::load_config(&config_path)?;
+                let state = match config.web_permissions_enabled() {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "custom",
+                };
+                println!("web_permissions_enabled={state}");
+            }
+        },
         Command::WebFiles { action } => match action {
             Some(WebFilesAction::Enable | WebFilesAction::Disable) => {
                 let enabled = matches!(action, Some(WebFilesAction::Enable));
                 client::set_web_files(&config_path, enabled)?;
                 println!(
-                    "web_files_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
+                    "web_files_enabled={enabled}; existing browser sessions expire within 30 minutes"
                 );
+                restart_hint();
             }
             Some(WebFilesAction::EnableUpload | WebFilesAction::DisableUpload) => {
                 let enabled = matches!(action, Some(WebFilesAction::EnableUpload));
                 client::set_web_uploads(&config_path, enabled)?;
                 println!(
-                    "web_uploads_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
+                    "web_uploads_enabled={enabled}; existing browser sessions expire within 30 minutes"
                 );
+                restart_hint();
             }
             Some(WebFilesAction::EnableManage | WebFilesAction::DisableManage) => {
                 let enabled = matches!(action, Some(WebFilesAction::EnableManage));
                 client::set_web_management(&config_path, enabled)?;
                 println!(
-                    "web_management_enabled={enabled}; restart the running daemon to apply; existing browser sessions expire within 30 minutes"
+                    "web_management_enabled={enabled}; existing browser sessions expire within 30 minutes"
                 );
+                restart_hint();
             }
             Some(
                 WebFilesAction::EnableEdit
@@ -372,9 +441,10 @@ async fn main() -> Result<()> {
                 );
                 client::set_web_editor(&config_path, execution, enabled)?;
                 println!(
-                    "web_{}_enabled={enabled}; restart the running daemon to apply",
+                    "web_{}_enabled={enabled}",
                     if execution { "run" } else { "edit" }
                 );
+                restart_hint();
             }
             Some(WebFilesAction::Status) | None => {
                 let config = client::load_config(&config_path)?;
@@ -390,6 +460,7 @@ async fn main() -> Result<()> {
         },
         Command::Sync => print_report(client::sync(&config_path).await?),
         Command::Daemon { .. } => client::daemon(&config_path).await?,
+        Command::Restart => unreachable!(),
         Command::Profiles => unreachable!(),
         Command::Status => {
             let status = client::status(&config_path).await?;

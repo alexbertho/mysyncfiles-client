@@ -2,6 +2,26 @@
 
 Voir le [README](../README.md) pour l’installation et les profils, la [publication signée](releases.md), et le [guide complet](https://github.com/alexbertho/mysyncfiles-server/blob/main/docs/install-client.md).
 
+## Autorisations et redémarrage
+
+Une nouvelle installation avec le client **0.4.2 ou ultérieur** propose d’autoriser ensemble la présence web, la lecture, l’envoi, le renommage et la suppression de dossiers, l’édition et l’exécution locale Python/C. Entrée accepte tout ; répondre `n` refuse tout. Une réinstallation conserve les choix enregistrés par défaut, même si l’appairage a été interrompu. Pour fixer le choix :
+
+```sh
+MYSYNC_WEB_PERMISSIONS=false sh install.sh
+# Depuis les sources, après compilation et appairage :
+MYSYNC_WEB_PERMISSIONS=true make install
+```
+
+Pour un appairage manuel : `mysync setup --web-permissions true ...` ou `false`. Sans cette option, `setup` conserve les préférences existantes ; un nouveau profil manuel active seulement la présence. Le choix global ne change ni la confiance TPM ni l’approbation de l’administrateur. `MYSYNC_WEB_STATUS` et `--web-status` restent disponibles pour la présence seule, séparément du choix global. Une ancienne release sans `--web-permissions` ne peut pas appliquer ce choix ; utiliser la release signée 0.4.2 ou ultérieure.
+
+Après une modification d’autorisation, une mise à jour du binaire ou l’ajout d’un profil, la commande du client récent est :
+
+```sh
+mysync restart
+```
+
+Elle exécute `systemctl --user daemon-reload` puis `systemctl --user restart mysync.service`, pour tous les profils enregistrés. Les changements de réglage affichent cette consigne. `mysync web-permissions enable` ou `disable` change tous les droits d’un profil, puis nécessite ce redémarrage. Si le profil est occupé, attendre la fin de la synchronisation ou arrêter le service avec `systemctl --user stop mysync.service` avant de changer les droits. Pour un daemon lancé dans un terminal, Ctrl+C puis relancer sa commande `mysync daemon` avec les mêmes options.
+
 ## Dépendances et certificat TPM
 
 Dans un terminal, l’installateur propose les paquets manquants sur Debian 13 et Arch Linux, y compris les distributions dérivées comme CachyOS : `curl`, Python 3, OpenSSL, `flock` (`util-linux`) et `systemctl` (`systemd`). Les bibliothèques TPM sont proposées si le binaire signé ne peut pas démarrer. Les outils `tpm2-tools` sont proposés lorsqu’une récupération du certificat EK est nécessaire. Le refus laisse l’installation arrêtée avec une consigne de reprise. Sans terminal, le script affiche la commande du gestionnaire de paquets à exécuter et conserve le certificat dans la commande d’appairage proposée.

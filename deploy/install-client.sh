@@ -8,6 +8,15 @@ case "$web_status" in
     ''|true|false) ;;
     *) printf 'MYSYNC_WEB_STATUS must be true or false.\n' >&2; exit 1 ;;
 esac
+web_permissions=${MYSYNC_WEB_PERMISSIONS:-}
+case "$web_permissions" in
+    ''|true|false) ;;
+    *) printf 'MYSYNC_WEB_PERMISSIONS must be true or false.\n' >&2; exit 1 ;;
+esac
+if [[ -n $web_status && -n $web_permissions ]]; then
+    printf 'Choose either MYSYNC_WEB_PERMISSIONS or MYSYNC_WEB_STATUS.\n' >&2
+    exit 1
+fi
 
 if [[ -z ${HOME:-} ]]; then
     printf 'HOME is required to install the client.\n' >&2
@@ -48,7 +57,30 @@ source_minor=${BASH_REMATCH[2]}
 source_patch=${BASH_REMATCH[3]}
 
 setup_help=$("$source_binary" setup --help)
-if [[ $setup_help == *--web-status* ]]; then
+if [[ $setup_help == *--web-permissions* && -z $web_status ]]; then
+    if [[ -z $web_permissions && -t 1 && -r /dev/tty ]]; then
+        saved_setting=$("$source_binary" --config "$config_path" web-permissions status)
+        case "$saved_setting" in
+            web_permissions_enabled=true) web_permissions=true; prompt='Y/n' ;;
+            web_permissions_enabled=false) web_permissions=false; prompt='y/N' ;;
+            web_permissions_enabled=custom) web_permissions=custom; prompt='y/n, Enter to keep saved permissions' ;;
+            *) printf 'Cannot read the saved browser permissions.\n' >&2; exit 1 ;;
+        esac
+        while :; do
+            printf 'Allow all browser permissions (status, files, uploads, rename/delete, editing and local code execution)? [%s] ' "$prompt" >/dev/tty
+            IFS= read -r answer </dev/tty || { printf 'Cannot read the browser permissions choice.\n' >&2; exit 1; }
+            case "$answer" in
+                '') break ;;
+                y|Y|yes|YES|o|O|oui|OUI) web_permissions=true; break ;;
+                n|N|no|NO|non|NON) web_permissions=false; break ;;
+                *) printf 'Please answer yes or no.\n' ;;
+            esac
+        done
+    fi
+elif [[ -n $web_permissions ]]; then
+    printf 'The source client lacks --web-permissions; build a client with this option.\n' >&2
+    exit 1
+elif [[ $setup_help == *--web-status* ]]; then
     if [[ -z $web_status && -t 1 && -r /dev/tty ]]; then
         saved_setting=$("$source_binary" --config "$config_path" web-status status)
         case "$saved_setting" in
@@ -133,7 +165,10 @@ unit_file="$unit_dir/mysync.service"
 [[ ! -L "$unit_file" ]] || { printf 'Refusing symbolic-link service file: %s\n' "$unit_file" >&2; exit 1; }
 install -m 644 "$project_dir/deploy/mysync.service" "$unit_file"
 
-if [[ -n $web_status ]]; then
+if [[ -n $web_permissions && $web_permissions != custom ]]; then
+    if [[ $web_permissions == true ]]; then action=enable; else action=disable; fi
+    "$destination" --config "$config_path" web-permissions "$action"
+elif [[ -n $web_status ]]; then
     if [[ $web_status == true ]]; then action=enable; else action=disable; fi
     "$destination" --config "$config_path" web-status "$action"
 fi
@@ -141,7 +176,16 @@ fi
 if [[ $(loginctl show-user "$account" --property=Linger --value) != yes ]]; then
     sudo loginctl enable-linger "$account"
 fi
-systemctl --user daemon-reload
-systemctl --user enable --now mysync.service
-systemctl --user restart mysync.service
+systemctl --user daemon-reload || {
+    printf 'Could not reload user units. Retry: systemctl --user daemon-reload && systemctl --user restart mysync.service\n' >&2
+    exit 1
+}
+systemctl --user enable mysync.service || {
+    printf 'Could not enable the user service. Retry: systemctl --user enable mysync.service\n' >&2
+    exit 1
+}
+systemctl --user restart mysync.service || {
+    printf 'Could not restart the user service. Retry: systemctl --user restart mysync.service; inspect: systemctl --user status mysync.service\n' >&2
+    exit 1
+}
 printf 'Installed %s; service enabled at boot for %s.\n' "$("$destination_dir/mysync" --version)" "$account"
